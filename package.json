@@ -20,5 +20,8 @@
   "bugs": {
     "url": "https://github.com/Saudagar7/chatify/issues"
   },
-  "homepage": "https://github.com/Saudagar7/chatify#readme"
+  "homepage": "https://github.com/Saudagar7/chatify#readme",
+  "dependencies": {
+    "cloudinary": "^2.5.1"
+  }
 }
