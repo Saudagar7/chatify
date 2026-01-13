@@ -14,6 +14,8 @@ const messageSchema = new mangoose.Schema(
         },
         text: {
             type: String,
+            trim: true,
+            maxlength: 2000,
             
         },
         image: {
