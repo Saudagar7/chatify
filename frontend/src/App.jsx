@@ -13,7 +13,7 @@ function App() {
   const {checkAuth, isCheckingAuth, authUser} = useAuthStore();
 
   useEffect(() => {
-    checkAuth()
+    checkAuth();
   }, [checkAuth]);
 
   
@@ -47,4 +47,4 @@ function App() {
   );
 }
 
-export default App
+export default App;
