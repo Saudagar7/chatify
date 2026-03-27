@@ -5,12 +5,7 @@ import toast from "react-hot-toast";
 
 const normalizeUrl = (url) => (url ? url.replace(/\/$/, "") : "");
 
-const HARD_CODED_SOCKET_URL = "https://1m3mrrh5-3000.inc1.devtunnels.ms";
-
 const resolveSocketOrigin = () => {
-  if (HARD_CODED_SOCKET_URL) {
-    return normalizeUrl(HARD_CODED_SOCKET_URL);
-  }
   const envUrl = normalizeUrl(import.meta.env.VITE_SOCKET_URL || import.meta.env.VITE_SERVER_URL);
   if (envUrl) return envUrl;
   const axiosBase = normalizeUrl(axiosInstance.defaults.baseURL);
@@ -132,26 +127,39 @@ export const useAuthStore = create((set, get) => ({
   },
 
   connectSocket: () => {
-    const { authUser } = get();
-    if (!authUser || get().socket?.connected) return;
+    const { authUser, socket } = get();
+    if (!authUser) return;
 
-    const socket = io(BASE_URL, {
-      withCredentials: true, 
+    if (socket) {
+      if (!socket.connected) socket.connect();
+      return;
+    }
+
+    const nextSocket = io(BASE_URL, {
+      withCredentials: true,
+      autoConnect: false,
     });
 
-    socket.connect();
+    nextSocket.on("connect_error", (error) => {
+      console.error("Socket connection failed:", error?.message || error);
+    });
 
-    set({ socket });
-
-    
-    socket.on("getOnlineUsers", (userIds) => {
+    nextSocket.on("getOnlineUsers", (userIds) => {
       set({ onlineUsers: userIds });
     });
+
+    nextSocket.connect();
+
+    set({ socket: nextSocket });
   },
 
   disconnectSocket: () => {
     const socket = get().socket;
-    if (socket?.connected) socket.disconnect();
+    if (socket) {
+      socket.off("getOnlineUsers");
+      socket.off("connect_error");
+      socket.disconnect();
+    }
     set({ socket: null, onlineUsers: [] });
   },
 

@@ -10,11 +10,19 @@ import { Toaster } from "react-hot-toast";
 
 
 function App() {
-  const {checkAuth, isCheckingAuth, authUser} = useAuthStore();
+  const { checkAuth, connectSocket, disconnectSocket, isCheckingAuth, authUser } = useAuthStore();
 
   useEffect(() => {
     checkAuth();
   }, [checkAuth]);
+
+  useEffect(() => {
+    if (authUser) {
+      connectSocket();
+      return;
+    }
+    disconnectSocket();
+  }, [authUser, connectSocket, disconnectSocket]);
 
   
 
