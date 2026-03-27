@@ -10,11 +10,38 @@ export const CALL_STATES = {
   CONNECTED: "connected",
 };
 
+const parseCsv = (value = "") =>
+  value
+    .split(",")
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+
+const DEFAULT_STUN_URLS = ["stun:stun.l.google.com:19302", "stun:stun1.l.google.com:19302"];
+
+const buildIceServers = () => {
+  const stunUrls = parseCsv(import.meta.env.VITE_STUN_URLS).length
+    ? parseCsv(import.meta.env.VITE_STUN_URLS)
+    : DEFAULT_STUN_URLS;
+
+  const turnUrls = parseCsv(import.meta.env.VITE_TURN_URLS);
+  const turnUsername = import.meta.env.VITE_TURN_USERNAME;
+  const turnCredential = import.meta.env.VITE_TURN_CREDENTIAL;
+
+  const iceServers = [{ urls: stunUrls }];
+
+  if (turnUrls.length) {
+    iceServers.push({
+      urls: turnUrls,
+      username: turnUsername,
+      credential: turnCredential,
+    });
+  }
+
+  return iceServers;
+};
+
 const RTC_CONFIGURATION = {
-  iceServers: [
-    { urls: "stun:stun.l.google.com:19302" },
-    { urls: "stun:stun1.l.google.com:19302" },
-  ],
+  iceServers: buildIceServers(),
   iceCandidatePoolSize: 4,
 };
 
@@ -74,9 +101,11 @@ export const useCallStore = create((set, get) => ({
   direction: null,
   callUser: null,
   incomingOffer: null,
+  pendingIceCandidates: [],
   localStream: null,
   remoteStream: null,
   peerConnection: null,
+  connectTimeoutId: null,
   isMuted: false,
   isCameraDisabled: false,
   socketBindings: null,
@@ -103,6 +132,7 @@ export const useCallStore = create((set, get) => ({
         direction: "incoming",
         callUser: from,
         incomingOffer: offer,
+        pendingIceCandidates: [],
         remoteStream: null,
       });
     };
@@ -112,6 +142,7 @@ export const useCallStore = create((set, get) => ({
       if (!peerConnection || !answer) return;
       try {
         await peerConnection.setRemoteDescription(buildSessionDescription(answer));
+        await get().flushPendingIceCandidates();
         set({ callState: CALL_STATES.CONNECTING });
       } catch (error) {
         console.error("Unable to set remote description", error);
@@ -121,11 +152,22 @@ export const useCallStore = create((set, get) => ({
 
     const handleIceCandidate = async ({ candidate }) => {
       const { peerConnection } = get();
-      if (!peerConnection || !candidate) return;
+      if (!candidate) return;
+
+      if (!peerConnection || !peerConnection.remoteDescription) {
+        set((state) => ({
+          pendingIceCandidates: [...state.pendingIceCandidates, candidate],
+        }));
+        return;
+      }
+
       try {
         await peerConnection.addIceCandidate(buildIceCandidate(candidate));
       } catch (error) {
         console.error("Unable to add ICE candidate", error);
+        set((state) => ({
+          pendingIceCandidates: [...state.pendingIceCandidates, candidate],
+        }));
       }
     };
 
@@ -173,6 +215,31 @@ export const useCallStore = create((set, get) => ({
     return useAuthStore.getState().socket;
   },
 
+  startConnectTimeout: () => {
+    const { connectTimeoutId } = get();
+    if (connectTimeoutId) {
+      clearTimeout(connectTimeoutId);
+    }
+
+    const timeoutId = setTimeout(() => {
+      const { callState } = get();
+      if (callState === CALL_STATES.CONNECTED || callState === CALL_STATES.IDLE) {
+        return;
+      }
+      toast.error("Unable to establish media path. Configure TURN server for cross-network calls.");
+    }, 12000);
+
+    set({ connectTimeoutId: timeoutId });
+  },
+
+  clearConnectTimeout: () => {
+    const { connectTimeoutId } = get();
+    if (connectTimeoutId) {
+      clearTimeout(connectTimeoutId);
+      set({ connectTimeoutId: null });
+    }
+  },
+
   startVideoCall: async (targetUser) => {
     if (!targetUser?._id) {
       toast.error("Select a contact first");
@@ -217,12 +284,15 @@ export const useCallStore = create((set, get) => ({
         callState: CALL_STATES.CALLING,
         direction: "outgoing",
         callUser: targetUser,
+        pendingIceCandidates: [],
         localStream,
         remoteStream: null,
         peerConnection,
         isMuted: false,
         isCameraDisabled: false,
       });
+
+      get().startConnectTimeout();
 
       const offer = await peerConnection.createOffer();
       await peerConnection.setLocalDescription(offer);
@@ -260,6 +330,7 @@ export const useCallStore = create((set, get) => ({
       get().attachPeerListeners(peerConnection);
 
       await peerConnection.setRemoteDescription(buildSessionDescription(incomingOffer));
+      await get().flushPendingIceCandidates();
       const answer = await peerConnection.createAnswer();
       await peerConnection.setLocalDescription(answer);
 
@@ -274,9 +345,12 @@ export const useCallStore = create((set, get) => ({
         localStream,
         peerConnection,
         incomingOffer: null,
+        pendingIceCandidates: [],
         isMuted: false,
         isCameraDisabled: false,
       });
+
+      get().startConnectTimeout();
     } catch (error) {
       console.error("Unable to accept call", error);
       toast.error("Unable to accept video call");
@@ -329,12 +403,14 @@ export const useCallStore = create((set, get) => ({
     peerConnection.ontrack = (event) => {
       const stream = event.streams?.[0];
       if (stream) {
+        get().clearConnectTimeout();
         set({ remoteStream: stream, callState: CALL_STATES.CONNECTED });
         return;
       }
       if (event.track) {
         const current = get().remoteStream || new MediaStream();
         current.addTrack(event.track);
+        get().clearConnectTimeout();
         set({ remoteStream: current, callState: CALL_STATES.CONNECTED });
       }
     };
@@ -353,10 +429,50 @@ export const useCallStore = create((set, get) => ({
 
     peerConnection.onconnectionstatechange = () => {
       const state = peerConnection.connectionState;
+      if (state === "connected") {
+        get().clearConnectTimeout();
+      }
       if (state === "failed" || state === "disconnected") {
         get().handleRemoteHangup("connection-lost");
       }
     };
+
+    peerConnection.oniceconnectionstatechange = () => {
+      const state = peerConnection.iceConnectionState;
+      if (state === "connected" || state === "completed") {
+        get().clearConnectTimeout();
+      }
+      if (state === "failed") {
+        toast.error("ICE failed. TURN relay may be required on this network.");
+      }
+    };
+
+    peerConnection.onicecandidateerror = (event) => {
+      console.warn("ICE candidate error", {
+        url: event?.url,
+        errorCode: event?.errorCode,
+        errorText: event?.errorText,
+      });
+    };
+  },
+
+  flushPendingIceCandidates: async () => {
+    const { peerConnection, pendingIceCandidates } = get();
+    if (!peerConnection || !peerConnection.remoteDescription || !pendingIceCandidates.length) {
+      return;
+    }
+
+    const remaining = [];
+    for (const candidate of pendingIceCandidates) {
+      try {
+        await peerConnection.addIceCandidate(buildIceCandidate(candidate));
+      } catch (error) {
+        console.error("Unable to flush ICE candidate", error);
+        remaining.push(candidate);
+      }
+    }
+
+    set({ pendingIceCandidates: remaining });
   },
 
   handleRemoteHangup: (reason = "hangup") => {
@@ -374,11 +490,14 @@ export const useCallStore = create((set, get) => ({
 
   resetCallState: (overrides = {}) => {
     const { peerConnection, localStream, remoteStream } = get();
+    get().clearConnectTimeout();
     if (peerConnection) {
       try {
         peerConnection.ontrack = null;
         peerConnection.onicecandidate = null;
         peerConnection.onconnectionstatechange = null;
+        peerConnection.oniceconnectionstatechange = null;
+        peerConnection.onicecandidateerror = null;
         peerConnection.close();
       } catch (error) {
         console.warn("Unable to close peer connection", error);
@@ -391,9 +510,11 @@ export const useCallStore = create((set, get) => ({
       direction: null,
       callUser: null,
       incomingOffer: null,
+      pendingIceCandidates: [],
       localStream: null,
       remoteStream: null,
       peerConnection: null,
+      connectTimeoutId: null,
       isMuted: false,
       isCameraDisabled: false,
       ...overrides,

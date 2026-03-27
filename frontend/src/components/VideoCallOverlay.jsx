@@ -40,12 +40,14 @@ function VideoCallOverlay() {
   useEffect(() => {
     if (localVideoRef.current) {
       localVideoRef.current.srcObject = localStream || null;
+      localVideoRef.current.play?.().catch(() => {});
     }
   }, [localStream]);
 
   useEffect(() => {
     if (remoteVideoRef.current) {
       remoteVideoRef.current.srcObject = remoteStream || null;
+      remoteVideoRef.current.play?.().catch(() => {});
     }
   }, [remoteStream]);
 
