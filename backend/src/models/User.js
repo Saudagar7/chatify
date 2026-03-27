@@ -1,4 +1,25 @@
 import mongoose from 'mongoose';
+import { PRIVACY_VISIBILITY_OPTIONS } from '../constants/privacy.js';
+
+const privacySettingsSchema = new mongoose.Schema(
+    {
+        profilePhoto: {
+            type: String,
+            enum: PRIVACY_VISIBILITY_OPTIONS,
+            default: 'everyone',
+        },
+        profilePhotoExceptions: {
+            type: [
+                {
+                    type: mongoose.Schema.Types.ObjectId,
+                    ref: 'User',
+                },
+            ],
+            default: [],
+        },
+    },
+    { _id: false }
+);
 
 const userSchema = new mongoose.Schema({
     email: {
@@ -11,14 +32,24 @@ const userSchema = new mongoose.Schema({
         required: true,
         
     },
+    about: {
+        type: String,
+        trim: true,
+        maxlength: 160,
+        default: "Available",
+    },
     password: {
         type: String,
         required: true,
         minlength: 6,
     },
-    profilePicture: {
+    profilePic: {
         type: String,
         default: "",
+    },
+    privacySettings: {
+        type: privacySettingsSchema,
+        default: () => ({}),
     },
 }, { timestamps: true });
 

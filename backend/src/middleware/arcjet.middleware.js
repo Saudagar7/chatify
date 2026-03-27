@@ -1,7 +1,11 @@
 import aj from "../lib/arcjet.js";
 import { isSpoofedBot } from "@arcjet/inspect";
+import { ENV } from "../lib/env.js";
+
+const shouldBypassArcjet = !ENV.ARCJET_KEY || ENV.NODE_ENV !== "production";
 
 export const arcjetProtection = async (req, res, next) => {
+    if (shouldBypassArcjet) return next();
    try {
     const decision = await aj.protect(req);
 
@@ -21,11 +25,11 @@ export const arcjetProtection = async (req, res, next) => {
         return res.status(403).json({ message: "Access denied by security policy." });
 
     }
-}
+    }
 
-if(decision.results.some(isSpoofedBot)) {
-    
-}
+    if(decision.results.some(isSpoofedBot)) {
+        return res.status(403).json({ message: "Access denied. Bot traffic is not allowed." });
+    }
     next();
 
 

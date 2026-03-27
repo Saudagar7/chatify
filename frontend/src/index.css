@@ -8,9 +8,51 @@
     syntax: '<angle>';
 }
 
+:root {
+    color-scheme: dark;
+    --app-bg: radial-gradient(circle at top, #0f172a 0%, #020617 65%, #01030a 100%);
+    --grid-color: rgba(79, 79, 79, 0.18);
+    --glow-top: rgba(236, 72, 153, 0.35);
+    --glow-bottom: rgba(6, 182, 212, 0.35);
+    --panel-left: rgba(15, 23, 42, 0.85);
+    --panel-right: rgba(2, 6, 23, 0.9);
+    --accent: #06b6d4;
+    --border: rgba(94, 234, 212, 0.45);
+    --text-primary: #e2e8f0;
+    --text-secondary: #94a3b8;
+    --surface: rgba(148, 163, 184, 0.08);
+    --glass: rgba(15, 23, 42, 0.5);
+    --input-bg: rgba(15, 23, 42, 0.6);
+}
+
+:root.theme-light {
+    color-scheme: light;
+    --app-bg: radial-gradient(circle at top, #eef2ff 0%, #f8fafc 60%, #e2e8f0 100%);
+    --grid-color: rgba(15, 23, 42, 0.08);
+    --glow-top: rgba(14, 165, 233, 0.4);
+    --glow-bottom: rgba(236, 72, 153, 0.25);
+    --panel-left: rgba(255, 255, 255, 0.95);
+    --panel-right: rgba(241, 245, 249, 0.95);
+    --accent: #0ea5e9;
+    --border: rgba(100, 116, 139, 0.35);
+    --text-primary: #0f172a;
+    --text-secondary: #475569;
+    --surface: rgba(148, 163, 184, 0.25);
+    --glass: rgba(241, 245, 249, 0.8);
+    --input-bg: rgba(255, 255, 255, 0.9);
+}
+
+body {
+    background: var(--app-bg);
+    color: var(--text-primary);
+    transition: background 300ms ease, color 200ms ease;
+}
+
 .input {
     @apply w-full bg-slate-800/50 border border-slate-700 rounded-lg py-2 pl-10 pr-4 text-slate-200 placeholder-slate-400 focus:ring-2 focus:ring-cyan-500 focus:border-transparent;
-
+    background-color: var(--input-bg);
+    border-color: var(--border);
+    color: var(--text-primary);
 }
 
 .auth-input-icon {
@@ -31,4 +73,99 @@
 
 .auth-link {
     @apply px-4 py-2 inline-block bg-cyan-500/10 rounded-lg text-cyan-400 hover:text-cyan-500 text-sm transition-colors;
+}
+
+.app-shell {
+    background: var(--app-bg);
+    color: var(--text-primary);
+}
+
+.theme-grid {
+    background-image:
+        linear-gradient(to right, var(--grid-color) 1px, transparent 1px),
+        linear-gradient(to bottom, var(--grid-color) 1px, transparent 1px);
+    background-size: 14px 24px;
+    opacity: 0.5;
+    pointer-events: none;
+}
+
+.theme-glow[data-position="top"] {
+    background: var(--glow-top);
+    opacity: 0.35;
+    filter: blur(100px);
+}
+
+.theme-glow[data-position="bottom"] {
+    background: var(--glow-bottom);
+    opacity: 0.35;
+    filter: blur(100px);
+}
+
+.theme-panel-left {
+    background-color: var(--panel-left);
+}
+
+.theme-panel-right {
+    background-color: var(--panel-right);
+}
+
+:root.theme-light .text-slate-200,
+:root.theme-light .text-slate-300,
+:root.theme-light .text-slate-100,
+:root.theme-light .text-white {
+    color: #0f172a !important;
+}
+
+:root.theme-light .text-slate-400,
+:root.theme-light .text-slate-500,
+:root.theme-light .text-slate-600 {
+    color: #475569 !important;
+}
+
+:root.theme-light .bg-slate-900,
+:root.theme-light .bg-slate-900\/95,
+:root.theme-light .bg-slate-950\/90,
+:root.theme-light .bg-slate-950\/80,
+:root.theme-light .bg-slate-950\/70,
+:root.theme-light .bg-slate-900\/70,
+:root.theme-light .bg-slate-900\/60,
+:root.theme-light .bg-slate-900\/50,
+:root.theme-light .bg-slate-900\/40,
+:root.theme-light .bg-slate-800,
+:root.theme-light .bg-slate-800\/70,
+:root.theme-light .bg-slate-800\/60,
+:root.theme-light .bg-slate-800\/50 {
+    background-color: rgba(255, 255, 255, 0.92) !important;
+    color: #0f172a !important;
+}
+
+:root.theme-light .bg-slate-800\/40,
+:root.theme-light .bg-slate-800\/30,
+:root.theme-light .bg-slate-800\/20,
+:root.theme-light .bg-slate-700\/40,
+:root.theme-light .bg-slate-700\/30,
+:root.theme-light .bg-slate-700\/20,
+:root.theme-light .bg-slate-900\/30,
+:root.theme-light .bg-slate-900\/20 {
+    background-color: rgba(148, 163, 184, 0.15) !important;
+    color: #0f172a !important;
+}
+
+:root.theme-light .border-slate-700,
+:root.theme-light .border-slate-700\/90,
+:root.theme-light .border-slate-700\/80,
+:root.theme-light .border-slate-700\/70,
+:root.theme-light .border-slate-700\/60,
+:root.theme-light .border-slate-700\/50,
+:root.theme-light .border-slate-800,
+:root.theme-light .border-slate-800\/80,
+:root.theme-light .border-slate-800\/70,
+:root.theme-light .border-slate-800\/60,
+:root.theme-light .border-slate-600\/60 {
+    border-color: rgba(15, 23, 42, 0.2) !important;
+}
+
+:root.theme-light .placeholder\:text-slate-500::placeholder,
+:root.theme-light .placeholder\:text-slate-400::placeholder {
+    color: #94a3b8 !important;
 }

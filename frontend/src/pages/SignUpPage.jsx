@@ -32,12 +32,16 @@ function SignUpPage() {
                 <form onSubmit={handleSubmit} className="space-y-6">
                   
                   <div>
-                    <label className="auth-input-label">Full Name</label>
+                    <label className="auth-input-label" htmlFor="signup-full-name">
+                      Full Name
+                    </label>
                     <div className="relative">
                       <UserIcon className="auth-input-icon" />
 
                       <input
                         type="text"
+                        id="signup-full-name"
+                        name="fullName"
                         value={formData.fullName}
                         onChange={(e) => setFormData({ ...formData, fullName: e.target.value })}
                         className="input"
@@ -48,12 +52,16 @@ function SignUpPage() {
 
                   
                   <div>
-                    <label className="auth-input-label">Email</label>
+                    <label className="auth-input-label" htmlFor="signup-email">
+                      Email
+                    </label>
                     <div className="relative">
                       <MailIcon className="auth-input-icon" />
 
                       <input
                         type="email"
+                        id="signup-email"
+                        name="email"
                         value={formData.email}
                         onChange={(e) => setFormData({ ...formData, email: e.target.value })}
                         className="input"
@@ -64,12 +72,16 @@ function SignUpPage() {
 
                   
                   <div>
-                    <label className="auth-input-label">Password</label>
+                    <label className="auth-input-label" htmlFor="signup-password">
+                      Password
+                    </label>
                     <div className="relative">
                       <LockIcon className="auth-input-icon" />
 
                       <input
                         type="password"
+                        id="signup-password"
+                        name="password"
                         value={formData.password}
                         onChange={(e) => setFormData({ ...formData, password: e.target.value })}
                         className="input"

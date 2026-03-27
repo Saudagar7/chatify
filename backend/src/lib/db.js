@@ -1,19 +1,18 @@
 import mongoose from 'mongoose';
 import { ENV } from './env.js';
 
-export const connectDB = async (mongoURI) => {
+export const connectDB = async (mongoURI = ENV.MONGO_URI) => {
     try {
-           const{MONGO_URI} = ENV;
-           if (!MONGO_URI) {
-               throw new Error("MONGO_URI is not set");
-           }
+        if (!mongoURI) {
+            throw new Error('MONGO_URI is not set');
+        }
 
-
-        const conn = await mongoose.connect(ENV.MONGO_URI)
-        console.log("MongoDB Connected:", conn.connection.host)
+        const conn = await mongoose.connect(mongoURI);
+        console.log('MongoDB Connected:', conn.connection.host ?? 'unknown host');
+        return conn;
     } catch (error) {
-        console.error("Error connection to MongoDB:", error);
-        process.exit(1);
+        console.error('Error connecting to MongoDB:', error.message);
+        throw error;
     }
-}
+};
         
