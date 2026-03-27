@@ -1,4 +1,4 @@
-export function getWelcomeEmailTemplate(name, clientURL) {
+export function createWelcomeEmailTemplate(name, clientURL) {
   const displayName = name || 'there';
   const link = clientURL || '#';
 

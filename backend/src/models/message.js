@@ -21,6 +21,39 @@ const messageSchema = new mangoose.Schema(
         image: {
             type: String,
         },
+        audio: {
+            type: String,
+        },
+        audioDuration: {
+            type: Number,
+            min: 0,
+        },
+        file: {
+            type: String,
+        },
+        fileName: {
+            type: String,
+            trim: true,
+        },
+        fileSize: {
+            type: Number,
+            min: 0,
+        },
+        fileType: {
+            type: String,
+            trim: true,
+        },
+        status: {
+            type: String,
+            enum: ["sent", "delivered", "read"],
+            default: "sent",
+        },
+        deliveredAt: {
+            type: Date,
+        },
+        readAt: {
+            type: Date,
+        },
     },
     { timestamps: true }
 );
