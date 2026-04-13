@@ -1,13 +1,30 @@
 import User from "../models/User.js";
 import bcrypt from "bcryptjs";
 import mongoose from "mongoose";
+import crypto from "crypto";
 import { ENV } from "../lib/env.js";
 import cloudinary from "../lib/cloudinary.js";
 import { generateToken } from "../lib/utils.js";
 import { sendWelcomeEmail } from "../emails/emailHandlers.js";
+import { sendResetOtpEmail } from "../lib/smtp.js";
 import { PRIVACY_VISIBILITY_OPTIONS } from "../constants/privacy.js";
 import { computeContactSetForUser, sanitizeUserForViewer } from "../lib/privacy.js";
 import { getReceiverSocketId, io } from "../lib/socket.js";
+
+const RESET_OTP_TTL_MS = 10 * 60 * 1000;
+const IS_DEVELOPMENT = ENV.NODE_ENV === "development";
+const RESET_OTP_RESEND_GAP_MS = IS_DEVELOPMENT ? 0 : 60 * 1000;
+const MAX_RESET_OTP_ATTEMPTS = IS_DEVELOPMENT ? 999 : 5;
+
+const normalizeEmail = (value = "") => value.trim().toLowerCase();
+
+const generateSixDigitOtp = () => String(Math.floor(Math.random() * 1000000)).padStart(6, "0");
+
+const hashOtp = (email, otp) =>
+    crypto
+        .createHash("sha256")
+        .update(`${normalizeEmail(email)}:${otp}:${ENV.JWT_SECRET || "chatify-reset"}`)
+        .digest("hex");
 
 const normalizeId = (value) => {
     if (!value) return "";
@@ -235,20 +252,48 @@ export const login = async (req, res) => {
 };
 
 export const resetPassword = async (req, res) => {
-    const { email, newPassword } = req.body;
+    const { email, otp, newPassword } = req.body;
 
-    if (!email || !newPassword) {
-        return res.status(400).json({ message: "Email and new password are required" });
+    if (!email || !otp || !newPassword) {
+        return res.status(400).json({ message: "Email, OTP, and new password are required" });
     }
 
     if (newPassword.length < 6) {
         return res.status(400).json({ message: "Password must be at least 6 characters" });
     }
 
+    if (!/^\d{6}$/.test(String(otp).trim())) {
+        return res.status(400).json({ message: "OTP must be a 6-digit code" });
+    }
+
     try {
-        const user = await User.findOne({ email });
+        const normalized = normalizeEmail(email);
+        const user = await User.findOne({ email: normalized });
         if (!user) {
             return res.status(404).json({ message: "No account found with that email" });
+        }
+
+        if (!user.resetPasswordOtpHash || !user.resetPasswordOtpExpiresAt) {
+            return res.status(400).json({ message: "Request a new OTP before resetting password" });
+        }
+
+        if (user.resetPasswordOtpExpiresAt.getTime() < Date.now()) {
+            user.resetPasswordOtpHash = null;
+            user.resetPasswordOtpExpiresAt = null;
+            user.resetPasswordOtpAttempts = 0;
+            await user.save();
+            return res.status(400).json({ message: "OTP expired. Request a new code" });
+        }
+
+        if ((user.resetPasswordOtpAttempts || 0) >= MAX_RESET_OTP_ATTEMPTS) {
+            return res.status(429).json({ message: "Too many invalid OTP attempts. Request a new code" });
+        }
+
+        const expectedHash = hashOtp(normalized, String(otp).trim());
+        if (expectedHash !== user.resetPasswordOtpHash) {
+            user.resetPasswordOtpAttempts = (user.resetPasswordOtpAttempts || 0) + 1;
+            await user.save();
+            return res.status(400).json({ message: "Invalid OTP" });
         }
 
         const isSamePassword = await bcrypt.compare(newPassword, user.password);
@@ -260,12 +305,54 @@ export const resetPassword = async (req, res) => {
 
         const salt = await bcrypt.genSalt(10);
         user.password = await bcrypt.hash(newPassword, salt);
+        user.resetPasswordOtpHash = null;
+        user.resetPasswordOtpExpiresAt = null;
+        user.resetPasswordOtpAttempts = 0;
         await user.save();
 
         return res.status(200).json({ message: "Password updated successfully" });
     } catch (error) {
         console.error("Error resetting password", error);
         return res.status(500).json({ message: "Internal server error" });
+    }
+};
+
+export const requestPasswordResetOtp = async (req, res) => {
+    const normalized = normalizeEmail(req.body?.email || "");
+    if (!normalized) {
+        return res.status(400).json({ message: "Email is required" });
+    }
+
+    try {
+        const user = await User.findOne({ email: normalized });
+        if (!user) {
+            return res.status(200).json({ message: "If the account exists, an OTP has been sent" });
+        }
+
+        const now = Date.now();
+        const lastSentAt = user.resetPasswordOtpLastSentAt?.getTime?.() || 0;
+        if (!IS_DEVELOPMENT && lastSentAt && now - lastSentAt < RESET_OTP_RESEND_GAP_MS) {
+            const retryAfter = Math.ceil((RESET_OTP_RESEND_GAP_MS - (now - lastSentAt)) / 1000);
+            return res.status(429).json({ message: "Please wait before requesting another OTP", retryAfter });
+        }
+
+        const otp = generateSixDigitOtp();
+        user.resetPasswordOtpHash = hashOtp(normalized, otp);
+        user.resetPasswordOtpExpiresAt = new Date(now + RESET_OTP_TTL_MS);
+        user.resetPasswordOtpAttempts = 0;
+        user.resetPasswordOtpLastSentAt = new Date(now);
+        await user.save();
+
+        await sendResetOtpEmail({
+            to: normalized,
+            fullName: user.fullName,
+            otp,
+        });
+
+        return res.status(200).json({ message: "OTP sent to your email" });
+    } catch (error) {
+        console.error("Error requesting password reset OTP", error);
+        return res.status(500).json({ message: "Unable to send OTP right now" });
     }
 };
 

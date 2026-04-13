@@ -78,6 +78,22 @@ const userSchema = new mongoose.Schema({
         ],
         default: [],
     },
+    resetPasswordOtpHash: {
+        type: String,
+        default: null,
+    },
+    resetPasswordOtpExpiresAt: {
+        type: Date,
+        default: null,
+    },
+    resetPasswordOtpAttempts: {
+        type: Number,
+        default: 0,
+    },
+    resetPasswordOtpLastSentAt: {
+        type: Date,
+        default: null,
+    },
 }, { timestamps: true });
 
  const User = mongoose.model('User', userSchema);

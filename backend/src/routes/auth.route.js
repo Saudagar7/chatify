@@ -1,5 +1,14 @@
 import express from 'express';
-import { signup, login, logout, updateprofile, updatePrivacySettings, resetPassword, toggleBlockUser } from '../controllers/auth.controller.js';
+import {
+	signup,
+	login,
+	logout,
+	updateprofile,
+	updatePrivacySettings,
+	resetPassword,
+	requestPasswordResetOtp,
+	toggleBlockUser,
+} from '../controllers/auth.controller.js';
 import { protectRoute } from '../middleware/auth.middleware.js'; 
 import arcjet from '@arcjet/node';
 import { arcjetProtection } from '../middleware/arcjet.middleware.js';
@@ -15,6 +24,7 @@ router.post('/login', login);
 
 router.post('/logout', logout);
 
+router.post('/reset-password/request-otp', requestPasswordResetOtp);
 router.post('/reset-password', resetPassword);
 
 router.put("/update-profile", protectRoute, updateprofile);

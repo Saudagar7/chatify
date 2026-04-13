@@ -28,6 +28,7 @@ export const useAuthStore = create((set, get) => ({
     isCheckingAuth: true,
     isSigningUp: false,
     isLoggingIn: false,
+  isRequestingResetOtp: false,
   isResettingPassword: false,
   socket: null,
   onlineUsers: [],
@@ -77,6 +78,20 @@ export const useAuthStore = create((set, get) => ({
 
       } finally {
         set({ isLoggingIn: false });
+      }
+    },
+
+    requestPasswordResetOtp: async (email) => {
+      set({ isRequestingResetOtp: true });
+      try {
+        await axiosInstance.post('/auth/reset-password/request-otp', { email });
+        toast.success('OTP sent to your email');
+        return true;
+      } catch (error) {
+        toast.error(error.response?.data?.message || 'Unable to send OTP');
+        return false;
+      } finally {
+        set({ isRequestingResetOtp: false });
       }
     },
 

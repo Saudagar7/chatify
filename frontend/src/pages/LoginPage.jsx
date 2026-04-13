@@ -10,6 +10,7 @@ import {
   ShieldCheckIcon,
   EyeIcon,
   EyeOffIcon,
+  XIcon,
 } from "lucide-react";
 import { Link } from "react-router";
 
@@ -18,23 +19,56 @@ function LoginPage() {
   const [resetData, setResetData] = useState({ email: "", newPassword: "", confirmPassword: "" });
   const [showResetForm, setShowResetForm] = useState(false);
   const [showHeroIntro, setShowHeroIntro] = useState(false);
-  const { login, isLoggingIn, resetPassword, isResettingPassword } = useAuthStore();
+  const {
+    login,
+    isLoggingIn,
+    requestPasswordResetOtp,
+    isRequestingResetOtp,
+    resetPassword,
+    isResettingPassword,
+  } = useAuthStore();
   const [showPassword, setShowPassword] = useState(false);
   const [showResetPassword, setShowResetPassword] = useState(false);
   const [showResetConfirm, setShowResetConfirm] = useState(false);
+  const [isOtpModalOpen, setIsOtpModalOpen] = useState(false);
+  const [otpDigits, setOtpDigits] = useState(["", "", "", "", "", ""]);
 
   useEffect(() => {
     const prefersReducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
 
-    if (prefersReducedMotion) {
-      setShowHeroIntro(true);
-      return undefined;
-    }
-
-    const timer = window.setTimeout(() => setShowHeroIntro(true), 220);
+    const timer = window.setTimeout(
+      () => setShowHeroIntro(true),
+      prefersReducedMotion ? 0 : 220
+    );
 
     return () => window.clearTimeout(timer);
   }, []);
+
+  const handleOtpInput = (index, value) => {
+    const cleaned = value.replace(/\D/g, "").slice(-1);
+    setOtpDigits((prev) => {
+      const next = [...prev];
+      next[index] = cleaned;
+      return next;
+    });
+
+    if (cleaned && index < 5) {
+      const nextInput = document.getElementById(`otp-digit-${index + 1}`);
+      nextInput?.focus();
+    }
+  };
+
+  const handleOtpKeyDown = (index, event) => {
+    if (event.key === "Backspace" && !otpDigits[index] && index > 0) {
+      const prevInput = document.getElementById(`otp-digit-${index - 1}`);
+      prevInput?.focus();
+    }
+  };
+
+  const closeOtpModal = () => {
+    setIsOtpModalOpen(false);
+    setOtpDigits(["", "", "", "", "", ""]);
+  };
 
   const handleSubmit = (e) => {
     e.preventDefault();
@@ -56,8 +90,25 @@ function LoginPage() {
       return;
     }
 
+    const sent = await requestPasswordResetOtp(resetData.email);
+    if (!sent) return;
+
+    setOtpDigits(["", "", "", "", "", ""]);
+    setIsOtpModalOpen(true);
+  };
+
+  const handleVerifyOtp = async (e) => {
+    e.preventDefault();
+
+    const otp = otpDigits.join("");
+    if (otp.length !== 6) {
+      toast.error("Please enter the 6-digit OTP");
+      return;
+    }
+
     const success = await resetPassword({
       email: resetData.email,
+      otp,
       newPassword: resetData.newPassword,
     });
 
@@ -65,7 +116,16 @@ function LoginPage() {
       setFormData({ email: resetData.email, password: resetData.newPassword });
       setResetData({ email: "", newPassword: "", confirmPassword: "" });
       setShowResetForm(false);
+      closeOtpModal();
     }
+  };
+
+  const handleResendOtp = async () => {
+    if (!resetData.email) {
+      toast.error("Enter email first");
+      return;
+    }
+    await requestPasswordResetOtp(resetData.email);
   };
 
   return (
@@ -263,14 +323,14 @@ function LoginPage() {
                       </div>
 
                       <button type="submit" className="auth-btn" disabled={isResettingPassword}>
-                        {isResettingPassword ? (
+                        {isRequestingResetOtp ? (
                           <LoaderIcon className="w-full h-5 animate-spin text-center" />
                         ) : (
-                          "Create new password"
+                          "Send OTP"
                         )}
                       </button>
                       <p className="text-xs text-slate-400 text-center">
-                        You'll be able to sign in immediately with your new password.
+                        We'll send a 6-digit verification code to your email.
                       </p>
                     </form>
                   )}
@@ -305,6 +365,63 @@ function LoginPage() {
           </div>
         </BorderAnimatedContainer>
       </div>
+
+      {isOtpModalOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/80 px-4">
+          <div className="w-full max-w-md rounded-2xl border border-cyan-500/30 bg-slate-900/95 p-6 shadow-2xl">
+            <div className="mb-4 flex items-center justify-between">
+              <div>
+                <h3 className="text-lg font-semibold text-slate-100">Verify OTP</h3>
+                <p className="text-xs text-slate-400">Enter the 6-digit code sent to {resetData.email}</p>
+              </div>
+              <button
+                type="button"
+                onClick={closeOtpModal}
+                className="rounded-full border border-slate-700/70 p-2 text-slate-300 hover:text-white"
+                aria-label="Close OTP modal"
+              >
+                <XIcon className="h-4 w-4" />
+              </button>
+            </div>
+
+            <form onSubmit={handleVerifyOtp} className="space-y-4">
+              <div className="flex items-center justify-between gap-2">
+                {otpDigits.map((digit, index) => (
+                  <input
+                    key={`otp-digit-${index}`}
+                    id={`otp-digit-${index}`}
+                    inputMode="numeric"
+                    autoComplete={index === 0 ? "one-time-code" : "off"}
+                    pattern="[0-9]*"
+                    maxLength={1}
+                    value={digit}
+                    onChange={(event) => handleOtpInput(index, event.target.value)}
+                    onKeyDown={(event) => handleOtpKeyDown(index, event)}
+                    className="h-12 w-12 rounded-xl border border-slate-700 bg-slate-800 text-center text-xl font-semibold text-slate-100 outline-none focus:border-cyan-500"
+                  />
+                ))}
+              </div>
+
+              <button type="submit" className="auth-btn" disabled={isResettingPassword}>
+                {isResettingPassword ? (
+                  <LoaderIcon className="w-full h-5 animate-spin text-center" />
+                ) : (
+                  "Verify OTP and reset password"
+                )}
+              </button>
+
+              <button
+                type="button"
+                onClick={handleResendOtp}
+                disabled={isRequestingResetOtp}
+                className="w-full rounded-lg border border-slate-700 py-2 text-sm text-slate-200 hover:border-cyan-500 disabled:opacity-60"
+              >
+                {isRequestingResetOtp ? "Resending..." : "Resend OTP"}
+              </button>
+            </form>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
