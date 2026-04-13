@@ -13,7 +13,6 @@ import { getReceiverSocketId, io } from "../lib/socket.js";
 
 const RESET_OTP_TTL_MS = 10 * 60 * 1000;
 const IS_DEVELOPMENT = ENV.NODE_ENV === "development";
-const RESET_OTP_RESEND_GAP_MS = IS_DEVELOPMENT ? 0 : 60 * 1000;
 const MAX_RESET_OTP_ATTEMPTS = IS_DEVELOPMENT ? 999 : 5;
 
 const normalizeEmail = (value = "") => value.trim().toLowerCase();
@@ -330,11 +329,6 @@ export const requestPasswordResetOtp = async (req, res) => {
         }
 
         const now = Date.now();
-        const lastSentAt = user.resetPasswordOtpLastSentAt?.getTime?.() || 0;
-        if (!IS_DEVELOPMENT && lastSentAt && now - lastSentAt < RESET_OTP_RESEND_GAP_MS) {
-            const retryAfter = Math.ceil((RESET_OTP_RESEND_GAP_MS - (now - lastSentAt)) / 1000);
-            return res.status(429).json({ message: "Please wait before requesting another OTP", retryAfter });
-        }
 
         const otp = generateSixDigitOtp();
         user.resetPasswordOtpHash = hashOtp(normalized, otp);
