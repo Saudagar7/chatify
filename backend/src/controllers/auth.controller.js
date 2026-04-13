@@ -6,6 +6,8 @@ import cloudinary from "../lib/cloudinary.js";
 import { generateToken } from "../lib/utils.js";
 import { sendWelcomeEmail } from "../emails/emailHandlers.js";
 import { PRIVACY_VISIBILITY_OPTIONS } from "../constants/privacy.js";
+import { computeContactSetForUser, sanitizeUserForViewer } from "../lib/privacy.js";
+import { getReceiverSocketId, io } from "../lib/socket.js";
 
 const normalizeId = (value) => {
     if (!value) return "";
@@ -33,6 +35,107 @@ const sanitizeExceptionIds = (exceptions = [], selfId) => {
 
     return sanitized;
 };
+
+const emitSocketEvent = (userId, eventName, payload) => {
+    const targetId = normalizeId(userId);
+    if (!targetId) return false;
+    const socketId = getReceiverSocketId(targetId);
+    if (!socketId) return false;
+    io.to(socketId).emit(eventName, payload);
+    return true;
+};
+
+const buildProfileVisibilityEvaluator = (userDoc, contactSet = new Set()) => {
+    const ownerId = normalizeId(userDoc?._id);
+    const settings = userDoc?.privacySettings || {};
+    const visibility = settings.profilePhoto || "everyone";
+    const exceptions = new Set(
+        (settings.profilePhotoExceptions || [])
+            .map((value) => normalizeId(value))
+            .filter(Boolean)
+    );
+
+    return (viewerId) => {
+        const viewer = normalizeId(viewerId);
+        if (!viewer) return false;
+        if (viewer === ownerId) return true;
+
+        switch (visibility) {
+            case "nobody":
+                return false;
+            case "contacts":
+                return contactSet.has(viewer);
+            case "contactsExcept":
+                return contactSet.has(viewer) && !exceptions.has(viewer);
+            case "everyone":
+            default:
+                return true;
+        }
+    };
+};
+
+const broadcastProfilePhotoUpdate = async (updatedUser) => {
+    if (!updatedUser) return;
+    const ownerId = normalizeId(updatedUser._id);
+    if (!ownerId) return;
+
+    try {
+        const contactSet = await computeContactSetForUser(ownerId);
+        const canViewerSeePhoto = buildProfileVisibilityEvaluator(updatedUser, contactSet);
+        const recipients = new Set([...contactSet, ownerId]);
+
+        recipients.forEach((viewerId) => {
+            const shouldShow = canViewerSeePhoto(viewerId);
+            emitSocketEvent(viewerId, "user:profileUpdated", {
+                _id: ownerId,
+                fullName: updatedUser.fullName,
+                profilePic: shouldShow ? updatedUser.profilePic : "",
+            });
+        });
+    } catch (error) {
+        console.error("Unable to broadcast profile photo update", error);
+    }
+};
+
+    const broadcastPresencePrivacyUpdate = async (updatedUser) => {
+        if (!updatedUser) return;
+        const ownerId = normalizeId(updatedUser._id);
+        if (!ownerId) return;
+
+        try {
+            const ownerContacts = await computeContactSetForUser(ownerId);
+            const recipients = new Set([...ownerContacts, ownerId]);
+            const isOnline = Boolean(getReceiverSocketId(ownerId));
+
+            await Promise.all(
+                [...recipients].map(async (viewerId) => {
+                    const normalizedViewerId = normalizeId(viewerId);
+                    if (!normalizedViewerId) return;
+
+                    const [viewerContacts, viewerDoc] = await Promise.all([
+                        computeContactSetForUser(normalizedViewerId),
+                        User.findById(normalizedViewerId).select("privacySettings").lean(),
+                    ]);
+
+                    const sanitized = sanitizeUserForViewer(
+                        updatedUser,
+                        normalizedViewerId,
+                        viewerContacts,
+                        { viewerPrivacySettings: viewerDoc?.privacySettings }
+                    );
+
+                    emitSocketEvent(normalizedViewerId, "user:presenceUpdated", {
+                        _id: ownerId,
+                        isOnline: sanitized?.isLastSeenVisible ? isOnline : false,
+                        lastSeenAt: sanitized?.isLastSeenVisible ? sanitized?.lastSeenAt || null : null,
+                        isLastSeenVisible: sanitized?.isLastSeenVisible !== false,
+                    });
+                })
+            );
+        } catch (error) {
+            console.error("Unable to broadcast presence privacy update", error);
+        }
+    };
 
 
 export const signup = async (req, res) => {
@@ -71,7 +174,9 @@ if(newUser) {
         email: savedUser.email,
         profilePic: savedUser.profilePic,
         about: savedUser.about,
+        lastSeenAt: savedUser.lastSeenAt,
         privacySettings: savedUser.privacySettings,
+        blockedUsers: savedUser.blockedUsers || [],
     });
 
     try {
@@ -107,6 +212,9 @@ export const login = async (req, res) => {
         const isPasswordCorrect = await bcrypt.compare(password, user.password);
         if (!isPasswordCorrect)  return res.status(400).json({ message: "Invalid credentials." });
 
+        user.lastSeenAt = new Date();
+        await user.save();
+
         generateToken(user._id,res)
         res.status(200).json({
             _id: user._id,
@@ -114,7 +222,9 @@ export const login = async (req, res) => {
             email: user.email,
             profilePic: user.profilePic,
             about: user.about,
+            lastSeenAt: user.lastSeenAt,
             privacySettings: user.privacySettings,
+            blockedUsers: user.blockedUsers || [],
         });
        
     } catch (error) {
@@ -203,31 +313,83 @@ export const updateprofile = async (req, res) => {
 export const updatePrivacySettings = async (req, res) => {
     try {
         const userId = req.user._id;
-        const { profilePhoto, profilePhotoExceptions } = req.body;
+        const {
+            profilePhoto,
+            profilePhotoExceptions,
+            lastSeen,
+            lastSeenExceptions,
+        } = req.body;
 
-        if (!profilePhoto || !PRIVACY_VISIBILITY_OPTIONS.includes(profilePhoto)) {
-            return res.status(400).json({ message: "Invalid privacy option" });
+        const currentSettings = req.user.privacySettings || {};
+        const nextProfilePhoto = profilePhoto || currentSettings.profilePhoto || "everyone";
+        const nextLastSeen = lastSeen || currentSettings.lastSeen || "everyone";
+
+        if (!PRIVACY_VISIBILITY_OPTIONS.includes(nextProfilePhoto)) {
+            return res.status(400).json({ message: "Invalid profile photo visibility option" });
         }
 
-        const nextExceptions = Array.isArray(profilePhotoExceptions)
+        if (!PRIVACY_VISIBILITY_OPTIONS.includes(nextLastSeen)) {
+            return res.status(400).json({ message: "Invalid last seen visibility option" });
+        }
+
+        const nextProfileExceptions = Array.isArray(profilePhotoExceptions)
             ? sanitizeExceptionIds(profilePhotoExceptions, userId)
             : sanitizeExceptionIds(req.user.privacySettings?.profilePhotoExceptions || [], userId);
+
+        const nextLastSeenExceptions = Array.isArray(lastSeenExceptions)
+            ? sanitizeExceptionIds(lastSeenExceptions, userId)
+            : sanitizeExceptionIds(req.user.privacySettings?.lastSeenExceptions || [], userId);
 
         const updatedUser = await User.findByIdAndUpdate(
             userId,
             {
                 $set: {
-                    "privacySettings.profilePhoto": profilePhoto,
-                    "privacySettings.profilePhotoExceptions": nextExceptions,
+                    "privacySettings.profilePhoto": nextProfilePhoto,
+                    "privacySettings.profilePhotoExceptions": nextProfileExceptions,
+                    "privacySettings.lastSeen": nextLastSeen,
+                    "privacySettings.lastSeenExceptions": nextLastSeenExceptions,
                 },
             },
             { new: true }
         ).select("-password");
 
         res.status(200).json(updatedUser);
+        broadcastProfilePhotoUpdate(updatedUser);
+        broadcastPresencePrivacyUpdate(updatedUser);
     } catch (error) {
         console.error("Error in updatePrivacySettings", error);
         res.status(500).json({ message: "Internal server error" });
+    }
+};
+
+export const toggleBlockUser = async (req, res) => {
+    try {
+        const userId = req.user._id;
+        const { targetUserId, shouldBlock } = req.body;
+
+        if (!mongoose.Types.ObjectId.isValid(targetUserId)) {
+            return res.status(400).json({ message: "Invalid user id" });
+        }
+
+        if (normalizeId(userId) === normalizeId(targetUserId)) {
+            return res.status(400).json({ message: "You cannot block yourself" });
+        }
+
+        const targetExists = await User.exists({ _id: targetUserId });
+        if (!targetExists) {
+            return res.status(404).json({ message: "User not found" });
+        }
+
+        const update = shouldBlock
+            ? { $addToSet: { blockedUsers: new mongoose.Types.ObjectId(targetUserId) } }
+            : { $pull: { blockedUsers: new mongoose.Types.ObjectId(targetUserId) } };
+
+        const updatedUser = await User.findByIdAndUpdate(userId, update, { new: true }).select("-password");
+
+        return res.status(200).json(updatedUser);
+    } catch (error) {
+        console.error("Error in toggleBlockUser", error);
+        return res.status(500).json({ message: "Internal server error" });
     }
 };
 

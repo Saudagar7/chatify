@@ -8,4 +8,6 @@ export const PRIVACY_VISIBILITY_OPTIONS = [
 export const PRIVACY_DEFAULTS = {
   profilePhoto: "everyone",
   profilePhotoExceptions: [],
+  lastSeen: "everyone",
+  lastSeenExceptions: [],
 };

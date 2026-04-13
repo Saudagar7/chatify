@@ -16,6 +16,16 @@ function ProfileHeader() {
 
   const fileInputRef = useRef(null);
 
+  const handleThemeToggle = (event) => {
+    const rect = event.currentTarget.getBoundingClientRect();
+    const hasPointerCoords = Number.isFinite(event.clientX) && Number.isFinite(event.clientY) && (event.clientX !== 0 || event.clientY !== 0);
+    const origin = hasPointerCoords
+      ? { x: event.clientX, y: event.clientY }
+      : { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+
+    toggleMode(origin);
+  };
+
   const handleImageUpload = (e) => {
     const file = e.target.files[0];
     if (!file) return;
@@ -78,7 +88,7 @@ function ProfileHeader() {
           {/* THEME TOGGLE */}
           <button
             className="group relative rounded-full border border-slate-600/60 p-2 text-slate-400 hover:text-white hover:border-cyan-400/60 transition-colors"
-            onClick={toggleMode}
+            onClick={handleThemeToggle}
             aria-label="Toggle color mode"
           >
             {mode === "dark" ? <SunIcon className="size-4" /> : <MoonIcon className="size-4" />}

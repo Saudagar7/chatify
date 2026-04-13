@@ -8,10 +8,16 @@ const normalizeUrl = (url) => (url ? url.replace(/\/$/, "") : "");
 const resolveSocketOrigin = () => {
   const envUrl = normalizeUrl(import.meta.env.VITE_SOCKET_URL || import.meta.env.VITE_SERVER_URL);
   if (envUrl) return envUrl;
+
   const axiosBase = normalizeUrl(axiosInstance.defaults.baseURL);
   if (axiosBase?.startsWith("http")) {
     return axiosBase.replace(/\/api$/, "");
   }
+
+  if (import.meta.env.MODE === "development" && typeof window !== "undefined") {
+    return `${window.location.protocol}//${window.location.hostname}:3000`;
+  }
+
   return window.location.origin;
 };
 
@@ -126,6 +132,19 @@ export const useAuthStore = create((set, get) => ({
     }
   },
 
+  toggleBlockUser: async ({ targetUserId, shouldBlock }) => {
+    try {
+      const res = await axiosInstance.put("/auth/block", { targetUserId, shouldBlock });
+      set({ authUser: res.data });
+      toast.success(shouldBlock ? "Contact blocked" : "Contact unblocked");
+      return true;
+    } catch (error) {
+      console.log("Error toggling block status:", error);
+      toast.error(error.response?.data?.message || "Unable to update block status");
+      return false;
+    }
+  },
+
   connectSocket: () => {
     const { authUser, socket } = get();
     if (!authUser) return;
@@ -138,6 +157,7 @@ export const useAuthStore = create((set, get) => ({
     const nextSocket = io(BASE_URL, {
       withCredentials: true,
       autoConnect: false,
+      transports: ["websocket", "polling"],
     });
 
     nextSocket.on("connect_error", (error) => {

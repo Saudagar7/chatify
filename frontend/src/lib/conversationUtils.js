@@ -66,6 +66,44 @@ const summarizeMessageContent = (message) => {
   return "Sent an update";
 };
 
+const isCallMessage = (message) =>
+  Boolean(message) && (message.messageType === "call" || Boolean(message.callMetadata));
+
+const formatCallDuration = (seconds = 0) => {
+  if (!Number.isFinite(seconds) || seconds <= 0) return null;
+  const minutes = Math.floor(seconds / 60);
+  const remainingSeconds = seconds % 60;
+  return `${minutes}:${remainingSeconds.toString().padStart(2, "0")}`;
+};
+
+const buildCallPreviewText = (message, viewerId) => {
+  if (!isCallMessage(message)) return "Call";
+  const metadata = message.callMetadata || {};
+  const callLabel = metadata.callType === "audio" ? "voice call" : "video call";
+  const status = (metadata.status || "").toLowerCase();
+  const initiatedByMe = normalizeId(metadata.initiatedBy) === normalizeId(viewerId);
+  const endedByMe = normalizeId(metadata.endedBy) === normalizeId(viewerId);
+  const duration = formatCallDuration(Number(metadata.durationSeconds) || 0);
+
+  switch (status) {
+    case "completed":
+      return duration ? `${callLabel} \u00b7 ${duration}` : `Completed ${callLabel}`;
+    case "missed":
+    case "unanswered":
+      return initiatedByMe ? `No answer (${callLabel})` : `Missed ${callLabel}`;
+    case "declined":
+      return endedByMe ? `You declined the ${callLabel}` : `Declined ${callLabel}`;
+    case "cancelled":
+      return initiatedByMe ? `Cancelled ${callLabel}` : `Call cancelled`;
+    case "busy":
+      return initiatedByMe ? `User busy (${callLabel})` : `You were busy (${callLabel})`;
+    case "failed":
+      return `Call failed (${callLabel})`;
+    default:
+      return callLabel;
+  }
+};
+
 export const buildChatPreview = (chat, authUser) => {
   if (!chat) return "";
   if (!chat.lastMessage) {
@@ -80,7 +118,10 @@ export const buildChatPreview = (chat, authUser) => {
   const myId = normalizeId(authUser?._id);
   const isOwnMessage = myId && senderId === myId;
   const senderName = isOwnMessage ? "You" : chat.lastMessage.sender?.fullName || "Someone";
-  const content = summarizeMessageContent(chat.lastMessage);
+  const isCall = isCallMessage(chat.lastMessage);
+  const content = isCall
+    ? buildCallPreviewText(chat.lastMessage, authUser?._id)
+    : summarizeMessageContent(chat.lastMessage);
 
   if (chat.isGroup) {
     return `${senderName}: ${content}`;

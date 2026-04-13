@@ -2,11 +2,12 @@ import mongoose from "mongoose";
 import cloudinary from "../lib/cloudinary.js";
 import Group from "../models/Group.js";
 import GroupMessage from "../models/GroupMessage.js";
+import { computeContactSetForUser } from "../lib/privacy.js";
 import {
-  computeContactSetForUser,
-  sanitizeUserForViewer,
-  sanitizeUsersForViewer,
-} from "../lib/privacy.js";
+  sanitizeGroupMessageForViewer,
+  sanitizeGroupPayload,
+} from "../lib/groupSanitizers.js";
+import { broadcastGroupMessageEvent } from "../lib/groupRealtime.js";
 
 const ensureBase64DataUri = (payload, mimeType, fallbackType = "application/octet-stream") => {
   if (!payload || typeof payload !== "string") return null;
@@ -15,59 +16,86 @@ const ensureBase64DataUri = (payload, mimeType, fallbackType = "application/octe
   return `data:${normalizedType};base64,${payload}`;
 };
 
-const serializeMessage = (messageDoc) => {
-  if (!messageDoc) return null;
-  const plain = typeof messageDoc.toObject === "function" ? messageDoc.toObject() : messageDoc;
-  if (plain.senderId && typeof plain.senderId === "object") {
-    plain.sender = plain.senderId;
-    plain.senderId = plain.senderId._id ?? plain.senderId;
-  } else {
-    plain.sender = null;
-  }
-  return plain;
-};
-
 const ensureGroupMembership = (group, userId) => {
   return group.members.some((member) => member.equals(userId));
 };
 
-const stripPrivacySettings = (user) => {
-  if (!user || typeof user !== "object") return user;
-  const cloned = { ...user };
-  if (Object.prototype.hasOwnProperty.call(cloned, "privacySettings")) {
-    delete cloned.privacySettings;
-  }
-  return cloned;
+const equalsObjectId = (a, b) => {
+  if (!a || !b) return false;
+  const valueA = typeof a === "object" && a.toString ? a.toString() : `${a}`;
+  const valueB = typeof b === "object" && b.toString ? b.toString() : `${b}`;
+  return valueA === valueB;
 };
 
-const sanitizeUserSnapshot = (user, viewerId, viewerContacts) => {
-  if (!user) return user;
-  return stripPrivacySettings(sanitizeUserForViewer(user, viewerId, viewerContacts));
+const normalizePollOptions = (rawOptions = []) => {
+  if (!Array.isArray(rawOptions)) return [];
+  const seen = new Set();
+  return rawOptions
+    .map((option) => {
+      if (typeof option === "string") return option.trim();
+      if (option && typeof option.label === "string") return option.label.trim();
+      return null;
+    })
+    .filter((label) => {
+      if (!label) return false;
+      const lower = label.toLowerCase();
+      if (seen.has(lower)) return false;
+      seen.add(lower);
+      return true;
+    })
+    .map((label) => ({ label, voters: [] }));
 };
 
-const sanitizeMemberList = (members = [], viewerId, viewerContacts) =>
-  sanitizeUsersForViewer(members, viewerId, viewerContacts).map(stripPrivacySettings);
-
-const sanitizeGroupPayload = (group, viewerId, viewerContacts) => {
-  if (!group) return group;
-  const sanitizedMembers = sanitizeMemberList(group.members || [], viewerId, viewerContacts);
-  const sanitizedAdmin = sanitizeUserSnapshot(group.admin, viewerId, viewerContacts);
-  let sanitizedLastMessage = group.lastMessage;
-
-  if (group.lastMessage?.sender) {
-    sanitizedLastMessage = {
-      ...group.lastMessage,
-      sender: sanitizeUserSnapshot(group.lastMessage.sender, viewerId, viewerContacts),
-    };
-  }
-
+const buildPollPayload = (pollInput, creatorId) => {
+  if (!pollInput) return null;
+  const question = pollInput.question?.trim();
+  if (!question) return null;
+  const options = normalizePollOptions(pollInput.options);
+  if (options.length < 2) return null;
   return {
-    ...group,
-    admin: sanitizedAdmin,
-    members: sanitizedMembers,
-    lastMessage: sanitizedLastMessage,
+    question,
+    allowMultiple: Boolean(pollInput.allowMultiple),
+    options,
+    createdBy: creatorId,
+    totalVotes: 0,
   };
 };
+
+const normalizeReactionEmoji = (value) => {
+  if (typeof value !== "string") return "";
+  return value.trim().slice(0, 16);
+};
+
+const applyReactionUpdate = (messageDoc, userId, emoji) => {
+  const userIdString = userId?.toString?.() || "";
+  if (!Array.isArray(messageDoc.reactions)) {
+    messageDoc.reactions = [];
+  }
+
+  const existingIndex = messageDoc.reactions.findIndex(
+    (reaction) => (reaction?.userId?.toString?.() || "") === userIdString
+  );
+
+  if (!emoji) {
+    if (existingIndex >= 0) {
+      messageDoc.reactions.splice(existingIndex, 1);
+    }
+    return;
+  }
+
+  if (existingIndex >= 0) {
+    const previousEmoji = messageDoc.reactions[existingIndex]?.emoji || "";
+    if (previousEmoji === emoji) {
+      messageDoc.reactions.splice(existingIndex, 1);
+    } else {
+      messageDoc.reactions[existingIndex].emoji = emoji;
+    }
+    return;
+  }
+
+  messageDoc.reactions.push({ userId, emoji });
+};
+
 
 export const createGroup = async (req, res) => {
   try {
@@ -315,19 +343,13 @@ export const getGroupMessages = async (req, res) => {
     })
       .sort({ createdAt: 1 })
       .populate("senderId", "fullName profilePic privacySettings")
+      .populate("poll.options.voters", "fullName profilePic privacySettings")
       .lean();
 
-    const serialized = messages.map((message) => ({
-      ...message,
-      sender: message.senderId,
-      senderId: message.senderId?._id,
-    }));
-
     const viewerContacts = await computeContactSetForUser(userId);
-    const sanitized = serialized.map((message) => ({
-      ...message,
-      sender: sanitizeUserSnapshot(message.sender, userId, viewerContacts),
-    }));
+    const sanitized = messages.map((message) =>
+      sanitizeGroupMessageForViewer(message, userId, viewerContacts)
+    );
 
     res.status(200).json(sanitized);
   } catch (error) {
@@ -343,6 +365,8 @@ export const sendGroupMessage = async (req, res) => {
     const {
       text,
       image,
+      video,
+      videoType,
       audio,
       audioType,
       audioDuration,
@@ -350,12 +374,20 @@ export const sendGroupMessage = async (req, res) => {
       fileName,
       fileSize,
       fileType,
+      poll,
     } = req.body;
 
     const trimmedText = text?.trim();
+    const pollPayload = buildPollPayload(poll, senderId);
 
-    if (!trimmedText && !image && !audio && !file) {
-      return res.status(400).json({ message: "Message text, media, audio, or file is required" });
+    if (!trimmedText && !image && !video && !audio && !file && !pollPayload) {
+      return res
+        .status(400)
+        .json({ message: "Provide text, media, audio, file, or poll content" });
+    }
+
+    if (poll && !pollPayload) {
+      return res.status(400).json({ message: "Poll must include a question and two options" });
     }
 
     const group = await Group.findById(groupId);
@@ -371,6 +403,15 @@ export const sendGroupMessage = async (req, res) => {
     if (image) {
       const uploadResponse = await cloudinary.uploader.upload(image);
       imageUrl = uploadResponse.secure_url;
+    }
+
+    let videoUrl;
+    if (video) {
+      const videoDataUri = ensureBase64DataUri(video, videoType, "video/mp4");
+      const uploadResponse = await cloudinary.uploader.upload(videoDataUri, {
+        resource_type: "video",
+      });
+      videoUrl = uploadResponse.secure_url;
     }
 
     let audioUrl;
@@ -396,20 +437,164 @@ export const sendGroupMessage = async (req, res) => {
       senderId,
       text: trimmedText,
       image: imageUrl,
+      video: videoUrl,
       audio: audioUrl,
       audioDuration: Number.isFinite(parsedDuration) && parsedDuration > 0 ? parsedDuration : undefined,
       file: fileUrl,
       fileName: fileName?.trim(),
       fileSize: Number.isFinite(Number(fileSize)) ? Number(fileSize) : undefined,
       fileType: fileType || undefined,
+      poll: pollPayload,
     });
 
     await newMessage.save();
-    await newMessage.populate("senderId", "fullName profilePic privacySettings");
+    await newMessage.populate([
+      { path: "senderId", select: "fullName profilePic privacySettings" },
+      { path: "poll.options.voters", select: "fullName profilePic privacySettings" },
+    ]);
 
-    res.status(201).json(serializeMessage(newMessage));
+    const viewerContacts = await computeContactSetForUser(senderId);
+    const sanitized = sanitizeGroupMessageForViewer(newMessage, senderId, viewerContacts);
+
+    await broadcastGroupMessageEvent({
+      group,
+      message: newMessage,
+      skipUserId: senderId,
+      eventName: "group:newMessage",
+    });
+
+    res.status(201).json(sanitized);
   } catch (error) {
     console.error("Error sending group message:", error.message);
+    res.status(500).json({ message: "Internal server error" });
+  }
+};
+
+export const voteOnPoll = async (req, res) => {
+  try {
+    const voterId = req.user._id;
+    const { groupId, messageId } = req.params;
+    const { optionIds = [] } = req.body;
+
+    if (!mongoose.Types.ObjectId.isValid(groupId) || !mongoose.Types.ObjectId.isValid(messageId)) {
+      return res.status(400).json({ message: "Invalid group or message id" });
+    }
+
+    const group = await Group.findById(groupId);
+    if (!group) {
+      return res.status(404).json({ message: "Group not found" });
+    }
+
+    if (!ensureGroupMembership(group, voterId)) {
+      return res.status(403).json({ message: "Not a member of this group" });
+    }
+
+    const message = await GroupMessage.findOne({ _id: messageId, groupId })
+      .populate("senderId", "fullName profilePic privacySettings")
+      .populate("poll.options.voters", "fullName profilePic privacySettings");
+
+    if (!message) {
+      return res.status(404).json({ message: "Message not found" });
+    }
+
+    if (!message.poll) {
+      return res.status(400).json({ message: "This message is not a poll" });
+    }
+
+    const normalizedOptionIds = Array.isArray(optionIds)
+      ? [...new Set(optionIds.map((id) => (id ? id.toString() : null)).filter(Boolean))]
+      : [];
+
+    const selectedOptionIds = message.poll.allowMultiple
+      ? normalizedOptionIds
+      : normalizedOptionIds.slice(0, 1);
+    const selectionSet = new Set(selectedOptionIds);
+
+    (message.poll.options || []).forEach((option) => {
+      const optionId = option._id?.toString();
+      const existing = Array.isArray(option.voters) ? option.voters : [];
+      option.voters = existing.filter((voter) => !equalsObjectId(voter?._id || voter, voterId));
+      if (selectionSet.size && optionId && selectionSet.has(optionId)) {
+        option.voters.push(voterId);
+      }
+    });
+
+    const pollOptions = message.poll.options || [];
+    message.poll.totalVotes = pollOptions.reduce(
+      (sum, option) => sum + (Array.isArray(option.voters) ? option.voters.length : 0),
+      0
+    );
+
+    await message.save();
+    await message.populate([
+      { path: "senderId", select: "fullName profilePic privacySettings" },
+      { path: "poll.options.voters", select: "fullName profilePic privacySettings" },
+    ]);
+
+    const viewerContacts = await computeContactSetForUser(voterId);
+    const sanitized = sanitizeGroupMessageForViewer(message, voterId, viewerContacts);
+
+    await broadcastGroupMessageEvent({
+      group,
+      message,
+      skipUserId: voterId,
+      eventName: "group:messageUpdated",
+    });
+
+    res.status(200).json(sanitized);
+  } catch (error) {
+    console.error("Error voting on poll:", error.message);
+    res.status(500).json({ message: "Internal server error" });
+  }
+};
+
+export const reactToGroupMessage = async (req, res) => {
+  try {
+    const userId = req.user._id;
+    const { groupId, messageId } = req.params;
+    const emoji = normalizeReactionEmoji(req.body?.emoji);
+
+    if (!mongoose.Types.ObjectId.isValid(groupId) || !mongoose.Types.ObjectId.isValid(messageId)) {
+      return res.status(400).json({ message: "Invalid group or message id" });
+    }
+
+    const group = await Group.findById(groupId);
+    if (!group) {
+      return res.status(404).json({ message: "Group not found" });
+    }
+
+    if (!ensureGroupMembership(group, userId)) {
+      return res.status(403).json({ message: "Not a member of this group" });
+    }
+
+    const message = await GroupMessage.findOne({ _id: messageId, groupId })
+      .populate("senderId", "fullName profilePic privacySettings")
+      .populate("poll.options.voters", "fullName profilePic privacySettings");
+
+    if (!message) {
+      return res.status(404).json({ message: "Message not found" });
+    }
+
+    applyReactionUpdate(message, userId, emoji);
+    await message.save();
+    await message.populate([
+      { path: "senderId", select: "fullName profilePic privacySettings" },
+      { path: "poll.options.voters", select: "fullName profilePic privacySettings" },
+    ]);
+
+    const viewerContacts = await computeContactSetForUser(userId);
+    const sanitized = sanitizeGroupMessageForViewer(message, userId, viewerContacts);
+
+    await broadcastGroupMessageEvent({
+      group,
+      message,
+      skipUserId: userId,
+      eventName: "group:messageUpdated",
+    });
+
+    res.status(200).json(sanitized);
+  } catch (error) {
+    console.error("Error reacting to group message:", error.message);
     res.status(500).json({ message: "Internal server error" });
   }
 };

@@ -56,19 +56,57 @@ const stopStreamTracks = (stream) => {
   });
 };
 
-const ensureMediaStream = async () => {
+const normalizeGetUserMediaError = (error) => {
+  const errorName = error?.name || "";
+  if (errorName === "NotAllowedError" || errorName === "SecurityError") {
+    const wrapped = new Error("Camera and microphone permission denied. Please allow access to start a video call.");
+    wrapped.name = errorName;
+    return wrapped;
+  }
+  if (errorName === "NotFoundError") {
+    const wrapped = new Error("No camera or microphone detected on this device.");
+    wrapped.name = errorName;
+    return wrapped;
+  }
+  if (errorName === "NotReadableError") {
+    const wrapped = new Error("Camera appears to be in use by another application.");
+    wrapped.name = errorName;
+    return wrapped;
+  }
+  return error;
+};
+
+const requestUserMedia = async (constraints) => {
   if (typeof navigator === "undefined" || !navigator.mediaDevices?.getUserMedia) {
     throw new Error("Camera or microphone not supported in this browser");
   }
   try {
-    return await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+    return await navigator.mediaDevices.getUserMedia(constraints);
   } catch (error) {
-    const errorName = error?.name || "";
-    if (errorName === "NotAllowedError" || errorName === "SecurityError") {
-      throw new Error("Camera and microphone permission denied. Please allow access to start a video call.");
-    }
-    if (errorName === "NotFoundError") {
-      throw new Error("No camera or microphone detected on this device.");
+    throw normalizeGetUserMediaError(error);
+  }
+};
+
+const acquireLocalCallStream = async () => {
+  try {
+    const stream = await requestUserMedia({ video: true, audio: true });
+    return {
+      stream,
+      hasVideoTrack: Boolean(stream.getVideoTracks?.().length),
+      fallbackNotice: null,
+    };
+  } catch (error) {
+    if (error?.name === "NotReadableError") {
+      try {
+        const audioOnlyStream = await requestUserMedia({ video: false, audio: true });
+        return {
+          stream: audioOnlyStream,
+          hasVideoTrack: false,
+          fallbackNotice: "Camera is currently in use by another application. Joined the call with microphone only.",
+        };
+      } catch {
+        throw error;
+      }
     }
     throw error;
   }
@@ -109,6 +147,7 @@ export const useCallStore = create((set, get) => ({
   isMuted: false,
   isCameraDisabled: false,
   socketBindings: null,
+  activeCallId: null,
 
   bindSocketEvents: (socket) => {
     if (!socket) return;
@@ -121,10 +160,10 @@ export const useCallStore = create((set, get) => ({
       });
     }
 
-    const handleIncomingCall = ({ from, offer }) => {
+    const handleIncomingCall = ({ from, offer, callId }) => {
       const { callState } = get();
       if (callState !== CALL_STATES.IDLE) {
-        socket.emit("call:busy", { targetUserId: from?._id });
+        socket.emit("call:busy", { targetUserId: from?._id, callId });
         return;
       }
       set({
@@ -134,12 +173,14 @@ export const useCallStore = create((set, get) => ({
         incomingOffer: offer,
         pendingIceCandidates: [],
         remoteStream: null,
+        activeCallId: callId || null,
       });
     };
 
-    const handleAnswered = async ({ answer }) => {
-      const { peerConnection } = get();
+    const handleAnswered = async ({ answer, callId }) => {
+      const { peerConnection, activeCallId } = get();
       if (!peerConnection || !answer) return;
+      if (callId && activeCallId && callId !== activeCallId) return;
       try {
         await peerConnection.setRemoteDescription(buildSessionDescription(answer));
         await get().flushPendingIceCandidates();
@@ -150,9 +191,10 @@ export const useCallStore = create((set, get) => ({
       }
     };
 
-    const handleIceCandidate = async ({ candidate }) => {
-      const { peerConnection } = get();
+    const handleIceCandidate = async ({ candidate, callId }) => {
+      const { peerConnection, activeCallId } = get();
       if (!candidate) return;
+      if (callId && activeCallId && callId !== activeCallId) return;
 
       if (!peerConnection || !peerConnection.remoteDescription) {
         set((state) => ({
@@ -171,16 +213,24 @@ export const useCallStore = create((set, get) => ({
       }
     };
 
-    const handleCallEnded = ({ reason }) => {
+    const handleCallEnded = ({ reason, callId }) => {
+      const { activeCallId } = get();
+      if (callId && activeCallId && callId !== activeCallId) {
+        return;
+      }
       get().handleRemoteHangup(reason || "hangup");
     };
 
-    const handleBusy = () => {
+    const handleBusy = ({ callId }) => {
+      const { activeCallId } = get();
+      if (callId && activeCallId && callId !== activeCallId) return;
       toast.error("User is on another call");
       get().resetCallState();
     };
 
-    const handleUnavailable = () => {
+    const handleUnavailable = ({ callId }) => {
+      const { activeCallId } = get();
+      if (callId && activeCallId && callId !== activeCallId) return;
       toast.error("User is unavailable for a video call");
       get().resetCallState();
     };
@@ -275,7 +325,7 @@ export const useCallStore = create((set, get) => ({
     }
 
     try {
-      const localStream = await ensureMediaStream();
+      const { stream: localStream, hasVideoTrack, fallbackNotice } = await acquireLocalCallStream();
       const peerConnection = new RTCPeerConnection(RTC_CONFIGURATION);
       localStream.getTracks().forEach((track) => peerConnection.addTrack(track, localStream));
       get().attachPeerListeners(peerConnection);
@@ -289,8 +339,12 @@ export const useCallStore = create((set, get) => ({
         remoteStream: null,
         peerConnection,
         isMuted: false,
-        isCameraDisabled: false,
+        isCameraDisabled: !hasVideoTrack,
       });
+
+      if (fallbackNotice) {
+        toast(fallbackNotice);
+      }
 
       get().startConnectTimeout();
 
@@ -298,14 +352,29 @@ export const useCallStore = create((set, get) => ({
       await peerConnection.setLocalDescription(offer);
 
       const { authUser } = useAuthStore.getState();
-      socket.emit("call:offer", {
-        targetUserId: targetUser._id,
-        offer,
-        metadata: {
-          fullName: authUser?.fullName,
-          profilePic: authUser?.profilePic,
+      socket.emit(
+        "call:offer",
+        {
+          targetUserId: targetUser._id,
+          offer,
+          metadata: {
+            fullName: authUser?.fullName,
+            profilePic: authUser?.profilePic,
+            callType: "video",
+            conversationType: "direct",
+          },
         },
-      });
+        (response) => {
+          if (response?.error) {
+            toast.error(response.error || "Unable to start video call");
+            get().resetCallState();
+            return;
+          }
+          if (response?.callId) {
+            set({ activeCallId: response.callId });
+          }
+        }
+      );
     } catch (error) {
       console.error("Unable to start call", error);
       toast.error(error?.message || "Unable to start video call");
@@ -314,8 +383,8 @@ export const useCallStore = create((set, get) => ({
   },
 
   acceptIncomingCall: async () => {
-    const { callUser, incomingOffer } = get();
-    if (!callUser || !incomingOffer) return;
+    const { callUser, incomingOffer, activeCallId } = get();
+    if (!callUser || !incomingOffer || !activeCallId) return;
 
     const socket = useAuthStore.getState().socket;
     if (!socket) {
@@ -324,7 +393,7 @@ export const useCallStore = create((set, get) => ({
     }
 
     try {
-      const localStream = await ensureMediaStream();
+      const { stream: localStream, hasVideoTrack, fallbackNotice } = await acquireLocalCallStream();
       const peerConnection = new RTCPeerConnection(RTC_CONFIGURATION);
       localStream.getTracks().forEach((track) => peerConnection.addTrack(track, localStream));
       get().attachPeerListeners(peerConnection);
@@ -337,6 +406,7 @@ export const useCallStore = create((set, get) => ({
       socket.emit("call:answer", {
         targetUserId: callUser._id,
         answer,
+        callId: activeCallId,
       });
 
       set({
@@ -347,34 +417,46 @@ export const useCallStore = create((set, get) => ({
         incomingOffer: null,
         pendingIceCandidates: [],
         isMuted: false,
-        isCameraDisabled: false,
+        isCameraDisabled: !hasVideoTrack,
       });
+
+      if (fallbackNotice) {
+        toast(fallbackNotice);
+      }
 
       get().startConnectTimeout();
     } catch (error) {
       console.error("Unable to accept call", error);
-      toast.error("Unable to accept video call");
+      toast.error(error?.message || "Unable to accept video call");
       get().resetCallState();
     }
   },
 
   declineIncomingCall: () => {
-    const { callUser, direction } = get();
+    const { callUser, direction, activeCallId } = get();
     const socket = useAuthStore.getState().socket;
     if (socket && callUser?._id) {
-      socket.emit("call:hangup", {
+      const payload = {
         targetUserId: callUser._id,
         reason: direction === "incoming" ? "declined" : "hangup",
-      });
+      };
+      if (activeCallId) {
+        payload.callId = activeCallId;
+      }
+      socket.emit("call:hangup", payload);
     }
     get().resetCallState();
   },
 
   endCall: (reason = "hangup") => {
-    const { callUser } = get();
+    const { callUser, activeCallId } = get();
     const socket = useAuthStore.getState().socket;
     if (socket && callUser?._id) {
-      socket.emit("call:hangup", { targetUserId: callUser._id, reason });
+      const payload = { targetUserId: callUser._id, reason };
+      if (activeCallId) {
+        payload.callId = activeCallId;
+      }
+      socket.emit("call:hangup", payload);
     }
     get().resetCallState();
   },
@@ -390,8 +472,18 @@ export const useCallStore = create((set, get) => ({
 
   toggleCamera: () => {
     const { localStream, isCameraDisabled } = get();
+    if (!localStream) {
+      return;
+    }
+
+    const videoTracks = localStream.getVideoTracks?.() || [];
+    if (!videoTracks.length) {
+      toast.error("Camera unavailable. End the call and free up your camera before trying again.");
+      return;
+    }
+
     const next = !isCameraDisabled;
-    localStream?.getVideoTracks?.().forEach((track) => {
+    videoTracks.forEach((track) => {
       track.enabled = !next;
     });
     set({ isCameraDisabled: next });
@@ -517,6 +609,7 @@ export const useCallStore = create((set, get) => ({
       connectTimeoutId: null,
       isMuted: false,
       isCameraDisabled: false,
+      activeCallId: null,
       ...overrides,
     });
   },

@@ -4,6 +4,9 @@ class ChatSoundEngine {
   constructor() {
     this.audioContext = null;
     this.supported = typeof window !== "undefined" && !!(window.AudioContext || window.webkitAudioContext);
+    this.unlockHandler = null;
+    this.unlockEvents = ["pointerdown", "keydown", "touchstart"];
+    this.unlockRegistered = false;
   }
 
   ensureContext() {
@@ -16,6 +19,36 @@ class ChatSoundEngine {
       this.audioContext.resume().catch(() => {});
     }
     return this.audioContext;
+  }
+
+  setupGestureUnlock() {
+    if (!this.supported || typeof window === "undefined" || this.unlockRegistered) {
+      return;
+    }
+
+    const handler = () => {
+      const ctx = this.ensureContext();
+      if (ctx && ctx.state === "running") {
+        this.teardownGestureUnlock();
+      }
+    };
+
+    this.unlockHandler = handler;
+    this.unlockEvents.forEach((eventName) => {
+      window.addEventListener(eventName, handler, { passive: true });
+    });
+    this.unlockRegistered = true;
+  }
+
+  teardownGestureUnlock() {
+    if (!this.unlockRegistered || typeof window === "undefined") {
+      return;
+    }
+    this.unlockEvents.forEach((eventName) => {
+      window.removeEventListener(eventName, this.unlockHandler);
+    });
+    this.unlockHandler = null;
+    this.unlockRegistered = false;
   }
 
   playOutgoing() {

@@ -6,6 +6,7 @@ import { useAuthStore } from "./store/useAuthStore";
 import { useEffect } from "react";
 import PageLoader from "./components/PageLoader";
 import { Toaster } from "react-hot-toast";
+import { chatSoundEngine } from "./lib/chatSounds";
 
 
 
@@ -23,6 +24,11 @@ function App() {
     }
     disconnectSocket();
   }, [authUser, connectSocket, disconnectSocket]);
+
+  useEffect(() => {
+    chatSoundEngine.setupGestureUnlock();
+    return () => chatSoundEngine.teardownGestureUnlock();
+  }, []);
 
   
 

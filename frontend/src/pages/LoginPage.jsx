@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import toast from "react-hot-toast";
 import { useAuthStore } from "../store/useAuthStore";
 import BorderAnimatedContainer from "../components/BorderAnimatedContainer";
@@ -17,10 +17,24 @@ function LoginPage() {
   const [formData, setFormData] = useState({ email: "", password: "" });
   const [resetData, setResetData] = useState({ email: "", newPassword: "", confirmPassword: "" });
   const [showResetForm, setShowResetForm] = useState(false);
+  const [showHeroIntro, setShowHeroIntro] = useState(false);
   const { login, isLoggingIn, resetPassword, isResettingPassword } = useAuthStore();
   const [showPassword, setShowPassword] = useState(false);
   const [showResetPassword, setShowResetPassword] = useState(false);
   const [showResetConfirm, setShowResetConfirm] = useState(false);
+
+  useEffect(() => {
+    const prefersReducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+    if (prefersReducedMotion) {
+      setShowHeroIntro(true);
+      return undefined;
+    }
+
+    const timer = window.setTimeout(() => setShowHeroIntro(true), 220);
+
+    return () => window.clearTimeout(timer);
+  }, []);
 
   const handleSubmit = (e) => {
     e.preventDefault();
@@ -55,18 +69,30 @@ function LoginPage() {
   };
 
   return (
-    <div className="w-full flex items-center justify-center p-4 bg-slate-900">
-      <div className="relative w-full max-w-6xl md:h-[800px] h-[650px]">
-        <BorderAnimatedContainer>
-          <div className="w-full flex flex-col md:flex-row">
+    <div className="auth-page-shell w-full flex items-center justify-center bg-slate-900">
+      <div className="auth-page-card relative w-full max-w-6xl">
+        <BorderAnimatedContainer className="auth-page-surface">
+          <div className="w-full h-full flex flex-col md:flex-row">
             {/* FORM CLOUMN - LEFT SIDE */}
-            <div className="md:w-1/2 p-8 flex items-center justify-center md:border-r border-slate-600/30">
-              <div className="w-full max-w-md">
+            <div className="auth-page-column md:w-1/2 md:border-r border-slate-600/30">
+              <div className="w-full max-w-md mx-auto">
                 {/* HEADING TEXT */}
-                <div className="text-center mb-8">
-                  <MessageCircleIcon className="w-12 h-12 mx-auto text-slate-400 mb-4" />
-                  <h2 className="text-2xl font-bold text-slate-200 mb-2">Welcome Back</h2>
-                  <p className="text-slate-400">Login to access to your account</p>
+                <div className="text-center mb-8 login-hero-stack">
+                  <div
+                    className={`login-hero-logo ${showHeroIntro ? "login-hero-visible" : "login-hero-hidden"}`}
+                  >
+                    <MessageCircleIcon className="w-12 h-12 mx-auto text-slate-400 mb-4" />
+                  </div>
+                  <h2
+                    className={`text-2xl font-bold text-slate-200 mb-2 login-hero-title ${showHeroIntro ? "login-hero-visible" : "login-hero-hidden"}`}
+                  >
+                    Welcome Back
+                  </h2>
+                  <p
+                    className={`text-slate-400 login-hero-subtitle ${showHeroIntro ? "login-hero-visible" : "login-hero-hidden"}`}
+                  >
+                    Login to access to your account
+                  </p>
                 </div>
 
                 
@@ -128,20 +154,30 @@ function LoginPage() {
                   </button>
                 </form>
 
-                <div className="mt-6 text-center space-y-4">
+                <div className="auth-actions mt-8">
                   <button
                     type="button"
                     onClick={() => setShowResetForm((prev) => !prev)}
-                    className="auth-link flex items-center gap-2 justify-center"
+                    className="auth-action-btn"
+                    aria-expanded={showResetForm}
+                    aria-controls="reset-password-panel"
                   >
-                    <ShieldCheckIcon className="w-4 h-4" />
-                    Forgot password? Create a new one
+                    <span className="auth-action-icon-wrap">
+                      <ShieldCheckIcon className="w-4 h-4" />
+                    </span>
+                    <span className="auth-action-content">
+                      <span className="auth-action-title">Forgot password?</span>
+                      <span className="auth-action-subtitle">
+                        Create a new one securely
+                      </span>
+                    </span>
                   </button>
 
                   {showResetForm && (
                     <form
+                      id="reset-password-panel"
                       onSubmit={handleResetSubmit}
-                      className="space-y-4 rounded-2xl border border-slate-700/60 bg-slate-900/40 p-4 text-left"
+                      className="auth-reset-panel"
                     >
                       <div>
                         <label className="auth-input-label" htmlFor="reset-email">
@@ -239,8 +275,9 @@ function LoginPage() {
                     </form>
                   )}
 
-                  <Link to="/signup" className="auth-link">
-                    Don't have an account? Sign Up
+                  <Link to="/signup" className="auth-secondary-link">
+                    <span className="auth-secondary-link-title">Don't have an account?</span>
+                    <span className="auth-secondary-link-cta">Sign up now</span>
                   </Link>
                 </div>
               </div>

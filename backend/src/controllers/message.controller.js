@@ -5,6 +5,7 @@ import User from "../models/User.js";
 import Group from "../models/Group.js";
 import GroupMessage from "../models/GroupMessage.js";
 import { getReceiverSocketId, io } from "../lib/socket.js";
+import { broadcastGroupMessageEvent } from "../lib/groupRealtime.js";
 import {
     computeContactSetForUser,
     sanitizeUserForViewer,
@@ -80,6 +81,41 @@ const ensureBase64DataUri = (payload, mimeType, fallbackType = "application/octe
     return `data:${normalizedType};base64,${payload}`;
 };
 
+const normalizeReactionEmoji = (value) => {
+    if (typeof value !== "string") return "";
+    return value.trim().slice(0, 16);
+};
+
+const applyReactionUpdate = (messageDoc, userId, emoji) => {
+    const userIdString = userId?.toString?.() || "";
+    if (!Array.isArray(messageDoc.reactions)) {
+        messageDoc.reactions = [];
+    }
+
+    const existingIndex = messageDoc.reactions.findIndex(
+        (reaction) => (reaction?.userId?.toString?.() || "") === userIdString
+    );
+
+    if (!emoji) {
+        if (existingIndex >= 0) {
+            messageDoc.reactions.splice(existingIndex, 1);
+        }
+        return;
+    }
+
+    if (existingIndex >= 0) {
+        const previousEmoji = messageDoc.reactions[existingIndex]?.emoji || "";
+        if (previousEmoji === emoji) {
+            messageDoc.reactions.splice(existingIndex, 1);
+        } else {
+            messageDoc.reactions[existingIndex].emoji = emoji;
+        }
+        return;
+    }
+
+    messageDoc.reactions.push({ userId, emoji });
+};
+
 
 export const getAllContacts = async (req, res) => {
     try {
@@ -89,9 +125,9 @@ export const getAllContacts = async (req, res) => {
             .lean();
 
         const viewerContacts = await computeContactSetForUser(loggedInUserId);
-        const sanitized = sanitizeUsersForViewer(filteredUsers, loggedInUserId, viewerContacts).map(
-            stripPrivacySettings
-        );
+        const sanitized = sanitizeUsersForViewer(filteredUsers, loggedInUserId, viewerContacts, {
+            viewerPrivacySettings: req.user?.privacySettings,
+        }).map(stripPrivacySettings);
 
         res.status(200).json(sanitized);
 
@@ -229,6 +265,8 @@ export const sendMessage = async (req, res) => {
         const {
             text,
             image,
+            video,
+            videoType,
             audio,
             audioType,
             audioDuration,
@@ -242,8 +280,8 @@ export const sendMessage = async (req, res) => {
 
        const trimmedText = text?.trim();
 
-       if(!trimmedText && !image && !audio && !file){
-        return res.status(400).json({ message: "Message text, media, audio, or file is required" });
+    if(!trimmedText && !image && !video && !audio && !file){
+     return res.status(400).json({ message: "Message text, media, audio, video, or file is required" });
        }
        if(senderId.equals(receiverId)){
         return res.status(400).json({ message: "You cannot send message to yourself" });
@@ -252,6 +290,22 @@ export const sendMessage = async (req, res) => {
          if(!receiverExists){
         return res.status(404).json({ message: "Receiver not found" });
        }
+
+      const [senderUser, receiverUser] = await Promise.all([
+          User.findById(senderId).select("blockedUsers").lean(),
+          User.findById(receiverId).select("blockedUsers").lean(),
+      ]);
+
+      const senderBlockedUsers = new Set((senderUser?.blockedUsers || []).map((id) => id.toString()));
+      const receiverBlockedUsers = new Set((receiverUser?.blockedUsers || []).map((id) => id.toString()));
+
+      if (senderBlockedUsers.has(receiverId.toString())) {
+          return res.status(403).json({ message: "Unblock this contact to send messages" });
+      }
+
+      if (receiverBlockedUsers.has(senderId.toString())) {
+          return res.status(403).json({ message: "You are blocked by this contact" });
+      }
          
        
        
@@ -262,6 +316,15 @@ export const sendMessage = async (req, res) => {
         if (image) {
             const uploadResponse = await cloudinary.uploader.upload(image); 
             imageUrl = uploadResponse.secure_url;
+        }
+
+        let videoUrl;
+        if (video) {
+            const videoDataUri = ensureBase64DataUri(video, videoType, "video/mp4");
+            const uploadResponse = await cloudinary.uploader.upload(videoDataUri, {
+                resource_type: "video",
+            });
+            videoUrl = uploadResponse.secure_url;
         }
 
         let audioUrl;
@@ -287,6 +350,7 @@ export const sendMessage = async (req, res) => {
             receiverId,
             text: trimmedText,
             image: imageUrl,
+            video: videoUrl,
             audio: audioUrl,
             audioDuration: Number.isFinite(parsedDuration) && parsedDuration > 0 ? parsedDuration : undefined,
             file: fileUrl,
@@ -389,6 +453,7 @@ export const forwardMessage = async (req, res) => {
         const basePayload = {
             text: sourceMessage.text?.trim() || undefined,
             image: sourceMessage.image || undefined,
+            video: sourceMessage.video || undefined,
             audio: sourceMessage.audio || undefined,
             audioDuration: sourceMessage.audioDuration,
             file: sourceMessage.file || undefined,
@@ -401,6 +466,7 @@ export const forwardMessage = async (req, res) => {
         const errors = [];
         const validUsers = new Set();
         const validGroups = new Set();
+        const groupDocMap = new Map();
 
         const userTargetIds = normalizedTargets
             .filter((target) => target.type === "user")
@@ -415,10 +481,13 @@ export const forwardMessage = async (req, res) => {
         }
 
         if (groupTargetIds.length) {
-            const groups = await Group.find({ _id: { $in: groupTargetIds }, members: userId }).select(
-                "_id"
-            );
-            groups.forEach((group) => validGroups.add(group._id.toString()));
+            const groups = await Group.find({ _id: { $in: groupTargetIds }, members: userId })
+                .select("_id members");
+            groups.forEach((group) => {
+                const key = group._id.toString();
+                validGroups.add(key);
+                groupDocMap.set(key, group);
+            });
         }
 
         for (const target of normalizedTargets) {
@@ -455,6 +524,8 @@ export const forwardMessage = async (req, res) => {
                     continue;
                 }
 
+                const targetGroup = groupDocMap.get(target.id);
+
                 const newGroupMessage = new GroupMessage({
                     groupId: target.id,
                     senderId: userId,
@@ -469,6 +540,15 @@ export const forwardMessage = async (req, res) => {
                     targetId: target.id,
                     message: serializeGroupMessage(newGroupMessage),
                 });
+
+                if (targetGroup) {
+                    await broadcastGroupMessageEvent({
+                        group: targetGroup,
+                        message: newGroupMessage,
+                        skipUserId: userId,
+                        eventName: "group:newMessage",
+                    });
+                }
             }
         }
 
@@ -507,20 +587,8 @@ export const getChatPartners = async (req, res) => {
                 : msg.senderId.toString();
 
             latestMessagesMap[partnerId] = {
-                _id: msg._id,
-                text: msg.text,
-                image: msg.image,
-                audio: msg.audio,
-                audioDuration: msg.audioDuration,
-                file: msg.file,
-                fileName: msg.fileName,
-                fileSize: msg.fileSize,
-                fileType: msg.fileType,
-                createdAt: msg.createdAt,
-                senderId: msg.senderId,
+                ...msg,
                 status: msg.status || "sent",
-                deliveredAt: msg.deliveredAt,
-                readAt: msg.readAt,
             };
         });
 
@@ -547,7 +615,11 @@ export const getChatPartners = async (req, res) => {
 
         const viewerContacts = await computeContactSetForUser(loggedInUserId);
         const sanitized = unsanitized.map((entry) =>
-            stripPrivacySettings(sanitizeUserForViewer(entry, loggedInUserId, viewerContacts))
+            stripPrivacySettings(
+                sanitizeUserForViewer(entry, loggedInUserId, viewerContacts, {
+                    viewerPrivacySettings: req.user?.privacySettings,
+                })
+            )
         );
 
         res.status(200).json(sanitized);
@@ -586,8 +658,35 @@ export const updateMessage = async (req, res) => {
 
         message.text = text.trim();
         await message.save();
+        await message.populate("senderId", "fullName profilePic privacySettings");
 
-        res.status(200).json(message);
+        const serializedMessage = message.toObject({ getters: true });
+        const senderIdString = message.senderId?._id?.toString?.() || message.senderId?.toString?.();
+        const receiverIdString = message.receiverId?.toString?.();
+
+        const receiverContactSet = new Set(senderIdString ? [senderIdString] : []);
+        const sanitizedSender =
+            typeof serializedMessage.senderId === "object"
+                ? stripPrivacySettings(
+                      sanitizeUserForViewer(
+                          serializedMessage.senderId,
+                          receiverIdString,
+                          receiverContactSet
+                      )
+                  )
+                : serializedMessage.senderId;
+
+        if (senderIdString) {
+            emitToUser("messageUpdated", senderIdString, serializedMessage);
+        }
+        if (receiverIdString) {
+            emitToUser("messageUpdated", receiverIdString, {
+                ...serializedMessage,
+                senderId: sanitizedSender,
+            });
+        }
+
+        res.status(200).json(serializedMessage);
     } catch (error) {
         console.error("Error in updateMessage controller: ", error.message);
         res.status(500).json({ message: "Internal server error" });
@@ -633,6 +732,85 @@ export const markConversationAsRead = async (req, res) => {
         res.status(200).json({ updatedMessageIds: messageIds });
     } catch (error) {
         console.error("Error in markConversationAsRead controller: ", error.message);
+        res.status(500).json({ message: "Internal server error" });
+    }
+};
+
+export const clearConversation = async (req, res) => {
+    try {
+        const myId = req.user._id;
+        const { id: userToClearId } = req.params;
+
+        if (!mongoose.Types.ObjectId.isValid(userToClearId)) {
+            return res.status(400).json({ message: "Invalid user id" });
+        }
+
+        if (myId.equals(userToClearId)) {
+            return res.status(400).json({ message: "Cannot clear self conversation" });
+        }
+
+        await Message.deleteMany(buildConversationFilter(myId, userToClearId));
+
+        return res.status(200).json({ message: "Chat cleared successfully" });
+    } catch (error) {
+        console.error("Error in clearConversation controller:", error.message);
+        return res.status(500).json({ message: "Internal server error" });
+    }
+};
+
+export const reactToMessage = async (req, res) => {
+    try {
+        const { messageId } = req.params;
+        const userId = req.user._id;
+        const emoji = normalizeReactionEmoji(req.body?.emoji);
+
+        if (!mongoose.Types.ObjectId.isValid(messageId)) {
+            return res.status(400).json({ message: "Invalid message id" });
+        }
+
+        const message = await Message.findById(messageId);
+        if (!message) {
+            return res.status(404).json({ message: "Message not found" });
+        }
+
+        const isParticipant = message.senderId.equals(userId) || message.receiverId.equals(userId);
+        if (!isParticipant) {
+            return res.status(403).json({ message: "You can only react in your conversations" });
+        }
+
+        applyReactionUpdate(message, userId, emoji);
+        await message.save();
+        await message.populate("senderId", "fullName profilePic privacySettings");
+
+        const serializedMessage = message.toObject({ getters: true });
+        const senderIdString = message.senderId?._id?.toString?.() || message.senderId?.toString?.();
+        const receiverIdString = message.receiverId?.toString?.();
+
+        const receiverContactSet = new Set(senderIdString ? [senderIdString] : []);
+        const sanitizedSender =
+            typeof serializedMessage.senderId === "object"
+                ? stripPrivacySettings(
+                      sanitizeUserForViewer(
+                          serializedMessage.senderId,
+                          receiverIdString,
+                          receiverContactSet
+                      )
+                  )
+                : serializedMessage.senderId;
+
+        if (senderIdString) {
+            emitToUser("messageUpdated", senderIdString, serializedMessage);
+        }
+        if (receiverIdString) {
+            emitToUser("messageUpdated", receiverIdString, {
+                ...serializedMessage,
+                senderId: sanitizedSender,
+            });
+        }
+
+        res.status(200).json(serializedMessage);
+    } catch (error) {
+        console.error("Error in reactToMessage controller:", error.message);
         res.status(500).json({ message: "Internal server error" });
     }
 };

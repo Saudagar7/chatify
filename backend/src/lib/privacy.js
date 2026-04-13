@@ -87,7 +87,39 @@ export const normalizePrivacySettings = (settings = {}) => {
     normalized.profilePhotoExceptions = [];
   }
 
+  if (settings && PRIVACY_VISIBILITY_OPTIONS.includes(settings.lastSeen)) {
+    normalized.lastSeen = settings.lastSeen;
+  }
+
+  if (Array.isArray(settings?.lastSeenExceptions)) {
+    normalized.lastSeenExceptions = settings.lastSeenExceptions.map((value) => value);
+  } else {
+    normalized.lastSeenExceptions = [];
+  }
+
   return normalized;
+};
+
+const canViewerSeeField = ({ visibility, exceptions = [], ownerId, viewerId, viewerContacts }) => {
+  const owner = normalizeId(ownerId);
+  const viewer = normalizeId(viewerId);
+  if (!owner) return false;
+  if (viewer && viewer === owner) return true;
+
+  const exceptionSet = new Set(exceptions.map((value) => normalizeId(value)).filter(Boolean));
+  const isException = viewer && exceptionSet.has(viewer);
+
+  switch (visibility) {
+    case "nobody":
+      return false;
+    case "contacts":
+      return viewerContacts?.has(owner) || false;
+    case "contactsExcept":
+      return (viewerContacts?.has(owner) || false) && !isException;
+    case "everyone":
+    default:
+      return true;
+  }
 };
 
 export const shouldShowProfilePhoto = (
@@ -105,28 +137,48 @@ export const shouldShowProfilePhoto = (
   }
 
   const settings = normalizePrivacySettings(userDoc.privacySettings || {});
-  const exceptions = new Set(
-    (settings.profilePhotoExceptions || [])
-      .map((value) => normalizeId(value))
-      .filter(Boolean)
-  );
-  const isException = viewer && exceptions.has(viewer);
-
-  switch (settings.profilePhoto) {
-    case "everyone":
-      return true;
-    case "nobody":
-      return false;
-    case "contacts":
-      return viewerContacts?.has(ownerId) || false;
-    case "contactsExcept":
-      return (viewerContacts?.has(ownerId) || false) && !isException;
-    default:
-      return true;
-  }
+  return canViewerSeeField({
+    visibility: settings.profilePhoto,
+    exceptions: settings.profilePhotoExceptions,
+    ownerId,
+    viewerId: viewer,
+    viewerContacts,
+  });
 };
 
-export const sanitizeUserForViewer = (userDoc, viewerId, viewerContacts = new Set()) => {
+export const shouldShowLastSeen = (
+  userDoc,
+  viewerId,
+  viewerContacts = new Set(),
+  viewerPrivacySettings = null
+) => {
+  if (!userDoc) return false;
+  const viewer = normalizeId(viewerId);
+  const ownerId = normalizeId(userDoc._id || userDoc.id);
+  if (!ownerId) return false;
+  if (viewer && viewer === ownerId) return true;
+
+  const viewerSettings = normalizePrivacySettings(viewerPrivacySettings || {});
+  if (viewerSettings.lastSeen === "nobody") {
+    return false;
+  }
+
+  const settings = normalizePrivacySettings(userDoc.privacySettings || {});
+  return canViewerSeeField({
+    visibility: settings.lastSeen,
+    exceptions: settings.lastSeenExceptions,
+    ownerId,
+    viewerId: viewer,
+    viewerContacts,
+  });
+};
+
+export const sanitizeUserForViewer = (
+  userDoc,
+  viewerId,
+  viewerContacts = new Set(),
+  options = {}
+) => {
   if (!userDoc) return null;
   const plain = toPlainObject(userDoc);
   if (!plain) return null;
@@ -135,8 +187,23 @@ export const sanitizeUserForViewer = (userDoc, viewerId, viewerContacts = new Se
     plain.profilePic = "";
   }
 
+  const canSeeLastSeen = shouldShowLastSeen(
+    userDoc,
+    viewerId,
+    viewerContacts,
+    options?.viewerPrivacySettings || null
+  );
+  plain.isLastSeenVisible = canSeeLastSeen;
+  if (!canSeeLastSeen) {
+    plain.lastSeenAt = null;
+  }
+
   return plain;
 };
 
-export const sanitizeUsersForViewer = (users = [], viewerId, viewerContacts = new Set()) =>
-  users.map((user) => sanitizeUserForViewer(user, viewerId, viewerContacts));
+export const sanitizeUsersForViewer = (
+  users = [],
+  viewerId,
+  viewerContacts = new Set(),
+  options = {}
+) => users.map((user) => sanitizeUserForViewer(user, viewerId, viewerContacts, options));

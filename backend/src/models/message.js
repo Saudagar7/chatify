@@ -1,16 +1,98 @@
-import mangoose from 'mongoose';
+import mongoose from 'mongoose';
 
-const messageSchema = new mangoose.Schema(
+const callMetadataSchema = new mongoose.Schema(
+    {
+        callType: {
+            type: String,
+            enum: ["video", "audio"],
+            default: "video",
+        },
+        conversationType: {
+            type: String,
+            enum: ["direct", "group"],
+            default: "direct",
+        },
+        participants: [
+            {
+                type: mongoose.Schema.Types.ObjectId,
+                ref: "User",
+            },
+        ],
+        initiatedBy: {
+            type: mongoose.Schema.Types.ObjectId,
+            ref: "User",
+        },
+        status: {
+            type: String,
+            enum: ["missed", "declined", "completed", "cancelled", "failed", "busy", "unanswered"],
+        },
+        durationSeconds: {
+            type: Number,
+            min: 0,
+            default: 0,
+        },
+        startedAt: {
+            type: Date,
+        },
+        connectedAt: {
+            type: Date,
+        },
+        endedAt: {
+            type: Date,
+        },
+        endedReason: {
+            type: String,
+            trim: true,
+        },
+        endedBy: {
+            type: mongoose.Schema.Types.ObjectId,
+            ref: "User",
+        },
+        groupId: {
+            type: mongoose.Schema.Types.ObjectId,
+            ref: "Group",
+        },
+        sessionId: {
+            type: String,
+            trim: true,
+        },
+    },
+    { _id: false }
+);
+
+const reactionSchema = new mongoose.Schema(
+    {
+        userId: {
+            type: mongoose.Schema.Types.ObjectId,
+            ref: "User",
+            required: true,
+        },
+        emoji: {
+            type: String,
+            required: true,
+            trim: true,
+            maxlength: 16,
+        },
+    },
+    { _id: false }
+);
+
+const messageSchema = new mongoose.Schema(
     {
         senderId: {
-            type: mangoose.Schema.Types.ObjectId,
+            type: mongoose.Schema.Types.ObjectId,
             ref: 'User',
             required: true,
         },
         receiverId: {
-            type: mangoose.Schema.Types.ObjectId,
+            type: mongoose.Schema.Types.ObjectId,
             ref: 'User',
             required: true,
+        },
+        messageType: {
+            type: String,
+            enum: ["text", "call"],
+            default: "text",
         },
         text: {
             type: String,
@@ -19,6 +101,9 @@ const messageSchema = new mangoose.Schema(
             
         },
         image: {
+            type: String,
+        },
+        video: {
             type: String,
         },
         audio: {
@@ -54,8 +139,16 @@ const messageSchema = new mangoose.Schema(
         readAt: {
             type: Date,
         },
+        callMetadata: {
+            type: callMetadataSchema,
+            default: null,
+        },
+        reactions: {
+            type: [reactionSchema],
+            default: [],
+        },
     },
     { timestamps: true }
 );
-const Message = mangoose.model('Message', messageSchema);
+const Message = mongoose.model('Message', messageSchema);
 export default Message;

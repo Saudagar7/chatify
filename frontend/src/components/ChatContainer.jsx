@@ -9,6 +9,7 @@ import {
 } from "lucide-react";
 import { useAuthStore } from "../store/useAuthStore";
 import { useChatStore } from "../store/useChatStore";
+import { CALL_STATES, useCallStore } from "../store/useCallStore";
 import { useShallow } from "zustand/react/shallow";
 import ChatHeader from "./ChatHeader";
 import GroupInfoBar from "./GroupInfoBar";
@@ -19,6 +20,8 @@ import ContactProfileModal from "./ContactProfileModal";
 import VideoCallOverlay from "./VideoCallOverlay";
 import ForwardMessageModal from "./ForwardMessageModal";
 import VoiceMessagePlayer from "./VoiceMessagePlayer";
+import CallLogEntry from "./CallLogEntry";
+import { useThemeStore } from "../store/useThemeStore";
 
 const SEARCH_FILTERS = [
   { value: "all", label: "All" },
@@ -27,6 +30,8 @@ const SEARCH_FILTERS = [
   { value: "docs", label: "Documents" },
   { value: "audio", label: "Audio" },
 ];
+const QUICK_REACTIONS = ["👍", "❤️", "😂", "😮", "😢", "🙏"];
+const REACTION_TRAY_CLOSE_MS = 170;
 const EDIT_WINDOW_MS = 5 * 60 * 1000;
 
 const escapeRegExp = (value = "") => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -46,6 +51,9 @@ const matchesSearchFilter = (message = {}, filter = "all") => {
       return true;
   }
 };
+
+const isCallMessage = (message = {}) =>
+  Boolean(message) && (message.messageType === "call" || Boolean(message.callMetadata));
 
 const isSameDay = (a, b) =>
   a.getFullYear() === b.getFullYear() && a.getMonth() === b.getMonth() && a.getDate() === b.getDate();
@@ -82,6 +90,35 @@ const normalizeId = (value) => {
     if (value.id) return value.id.toString?.() || "";
   }
   return value.toString?.() || "";
+};
+
+const getPollSelectionsForUser = (poll = {}, userId) => {
+  if (!poll || !Array.isArray(poll.options) || !userId) return [];
+  const selections = [];
+  poll.options.forEach((option) => {
+    const voters = Array.isArray(option?.voters) ? option.voters : [];
+    const hasVote = voters.some((voter) => normalizeId(voter?._id || voter?.id) === userId);
+    if (hasVote && option?._id) {
+      selections.push(option._id.toString?.() || option._id);
+    }
+  });
+  return selections;
+};
+
+const buildReactionSummary = (reactions = [], myUserId = "") => {
+  const summaryMap = new Map();
+  reactions.forEach((reaction) => {
+    const emoji = reaction?.emoji;
+    if (!emoji) return;
+    const reactorId = normalizeId(reaction?.userId);
+    const existing = summaryMap.get(emoji) || { emoji, count: 0, reactedByMe: false };
+    existing.count += 1;
+    if (reactorId && myUserId && reactorId === myUserId) {
+      existing.reactedByMe = true;
+    }
+    summaryMap.set(emoji, existing);
+  });
+  return Array.from(summaryMap.values()).sort((a, b) => b.count - a.count);
 };
 
 const renderStatusIcon = (status = "sent") => {
@@ -126,7 +163,7 @@ const getMessageIdentity = (message) => {
   );
 };
 
-function ChatContainer() {
+function ChatContainer({ onBackToList }) {
   const {
     messages,
     chats,
@@ -142,9 +179,11 @@ function ChatContainer() {
     isOlderMessagesLoading,
     isJumpingToDate,
     selectedUser,
-    setSelectedUser,
     setEditingMessage,
+    reactToMessage,
     forwardMessages,
+    voteOnPoll,
+    clearConversation,
   } = useChatStore(
     useShallow((state) => ({
       messages: state.messages,
@@ -161,13 +200,30 @@ function ChatContainer() {
       isOlderMessagesLoading: state.isOlderMessagesLoading,
       isJumpingToDate: state.isJumpingToDate,
       selectedUser: state.selectedUser,
-      setSelectedUser: state.setSelectedUser,
       setEditingMessage: state.setEditingMessage,
+      reactToMessage: state.reactToMessage,
       forwardMessages: state.forwardMessages,
+      voteOnPoll: state.voteOnPoll,
+      clearConversation: state.clearConversation,
+    }))
+  );
+  const { callState, startVideoCall } = useCallStore(
+    useShallow((state) => ({
+      callState: state.callState,
+      startVideoCall: state.startVideoCall,
     }))
   );
   const authUser = useAuthStore((state) => state.authUser);
+  const toggleBlockUser = useAuthStore((state) => state.toggleBlockUser);
+  const toggleMode = useThemeStore((state) => state.toggleMode);
   const myUserId = useMemo(() => normalizeId(authUser?._id), [authUser?._id]);
+  const blockedUsers = useMemo(
+    () => new Set((authUser?.blockedUsers || []).map((id) => normalizeId(id))),
+    [authUser?.blockedUsers]
+  );
+  const isSelectedUserBlocked = Boolean(
+    selectedUser && !selectedUser.isGroup && blockedUsers.has(normalizeId(selectedUser._id))
+  );
 
   const [searchQuery, setSearchQuery] = useState("");
   const [searchFilter, setSearchFilter] = useState("all");
@@ -182,6 +238,10 @@ function ChatContainer() {
   const [showScrollToBottom, setShowScrollToBottom] = useState(false);
   const [pendingNewMessages, setPendingNewMessages] = useState(0);
   const [quickReplyDraft, setQuickReplyDraft] = useState("");
+  const [pollVoteBusyId, setPollVoteBusyId] = useState(null);
+  const [reactionPickerMessageId, setReactionPickerMessageId] = useState(null);
+  const [closingReactionPickerMessageId, setClosingReactionPickerMessageId] = useState(null);
+  const [lastTouchTap, setLastTouchTap] = useState({ messageId: null, at: 0 });
 
   const messageListRef = useRef(null);
   const messageRefs = useRef({});
@@ -191,6 +251,7 @@ function ChatContainer() {
   const pendingInitialScrollRef = useRef(false);
   const isNearBottomRef = useRef(true);
   const lastMessageKeyRef = useRef(null);
+  const reactionCloseTimerRef = useRef(null);
 
   const scrollToBottom = useCallback((behavior = "auto") => {
     const container = messageListRef.current;
@@ -318,6 +379,23 @@ function ChatContainer() {
   }, [selectedUser, isForwardModalOpen]);
 
   useEffect(() => {
+    setReactionPickerMessageId(null);
+    setClosingReactionPickerMessageId(null);
+    if (reactionCloseTimerRef.current) {
+      clearTimeout(reactionCloseTimerRef.current);
+      reactionCloseTimerRef.current = null;
+    }
+  }, [selectedUser?._id]);
+
+  useEffect(() => {
+    return () => {
+      if (reactionCloseTimerRef.current) {
+        clearTimeout(reactionCloseTimerRef.current);
+      }
+    };
+  }, []);
+
+  useEffect(() => {
     if (!activeMatchId) return;
     const target = messageRefs.current[activeMatchId];
     if (target) {
@@ -426,6 +504,78 @@ function ChatContainer() {
     setQuickReplyDraft("");
   }, []);
 
+  const closeReactionPicker = useCallback((messageId) => {
+    const targetId = messageId || reactionPickerMessageId;
+    if (!targetId) {
+      setReactionPickerMessageId(null);
+      setClosingReactionPickerMessageId(null);
+      return;
+    }
+
+    setReactionPickerMessageId((current) => (current === targetId ? null : current));
+    setClosingReactionPickerMessageId(targetId);
+
+    if (reactionCloseTimerRef.current) {
+      clearTimeout(reactionCloseTimerRef.current);
+    }
+
+    reactionCloseTimerRef.current = setTimeout(() => {
+      setClosingReactionPickerMessageId((current) =>
+        current === targetId ? null : current
+      );
+      reactionCloseTimerRef.current = null;
+    }, REACTION_TRAY_CLOSE_MS);
+  }, [reactionPickerMessageId]);
+
+  const handleApplyReaction = useCallback(
+    async (messageId, emoji) => {
+      if (!messageId) return;
+      await reactToMessage({ messageId, emoji });
+      closeReactionPicker(messageId);
+    },
+    [reactToMessage, closeReactionPicker]
+  );
+
+  const handleBubbleDoubleTap = useCallback(
+    (messageId) => {
+      if (!messageId) return;
+      if (reactionPickerMessageId === messageId) {
+        closeReactionPicker(messageId);
+        return;
+      }
+
+      if (reactionPickerMessageId) {
+        closeReactionPicker(reactionPickerMessageId);
+      }
+
+      setClosingReactionPickerMessageId((current) =>
+        current === messageId ? null : current
+      );
+      setReactionPickerMessageId(messageId);
+    },
+    [reactionPickerMessageId, closeReactionPicker]
+  );
+
+  const handleBubbleTouchEnd = useCallback(
+    (event, messageId) => {
+      if (!messageId) return;
+      if (event.target?.closest?.("button,a,input,textarea,select,video,audio")) {
+        return;
+      }
+      const now = Date.now();
+      const isDoubleTap =
+        lastTouchTap.messageId === messageId && now - lastTouchTap.at <= 320;
+      if (isDoubleTap) {
+        event.preventDefault();
+        handleBubbleDoubleTap(messageId);
+        setLastTouchTap({ messageId: null, at: 0 });
+        return;
+      }
+      setLastTouchTap({ messageId, at: now });
+    },
+    [lastTouchTap, handleBubbleDoubleTap]
+  );
+
   const loadOlderChunk = useCallback(async () => {
     if (
       !selectedUser ||
@@ -531,19 +681,95 @@ function ChatContainer() {
     }
   };
 
+  const handlePollOptionToggle = useCallback(
+    async (message, optionId) => {
+      if (
+        !selectedUser?.isGroup ||
+        !selectedUser?._id ||
+        !message?._id ||
+        !message?.poll ||
+        !optionId ||
+        pollVoteBusyId === message._id
+      ) {
+        return;
+      }
+
+      const normalizedOptionId = optionId.toString?.() || optionId;
+      if (!normalizedOptionId) return;
+
+      const currentSelections = getPollSelectionsForUser(message.poll, myUserId);
+      let nextSelections;
+      if (message.poll.allowMultiple) {
+        const selectionSet = new Set(currentSelections);
+        if (selectionSet.has(normalizedOptionId)) {
+          selectionSet.delete(normalizedOptionId);
+        } else {
+          selectionSet.add(normalizedOptionId);
+        }
+        nextSelections = Array.from(selectionSet);
+      } else {
+        nextSelections = currentSelections.includes(normalizedOptionId)
+          ? []
+          : [normalizedOptionId];
+      }
+
+      try {
+        setPollVoteBusyId(message._id);
+        await voteOnPoll({
+          groupId: selectedUser._id,
+          messageId: message._id,
+          optionIds: nextSelections,
+        });
+      } finally {
+        setPollVoteBusyId(null);
+      }
+    },
+    [selectedUser?.isGroup, selectedUser?._id, voteOnPoll, pollVoteBusyId, myUserId]
+  );
+
+  const handleMenuClearChat = useCallback(async () => {
+    if (!selectedUser?._id || selectedUser.isGroup) return;
+    const confirmed = window.confirm("Clear this chat for both participants?");
+    if (!confirmed) return;
+    await clearConversation(selectedUser._id);
+  }, [selectedUser, clearConversation]);
+
+  const handleMenuToggleBlock = useCallback(async () => {
+    if (!selectedUser?._id || selectedUser.isGroup) return;
+    await toggleBlockUser({
+      targetUserId: selectedUser._id,
+      shouldBlock: !isSelectedUserBlocked,
+    });
+  }, [selectedUser, toggleBlockUser, isSelectedUserBlocked]);
+
+  const handleMenuOpenTheme = useCallback(() => {
+    toggleMode();
+  }, [toggleMode]);
+
   if (!selectedUser) {
     return null;
   }
 
   const displayName = selectedUser.fullName || selectedUser.name || "this contact";
+  const isDirectConversation = Boolean(selectedUser && !selectedUser.isGroup);
+  const canRetryCall = isDirectConversation && callState === CALL_STATES.IDLE;
+  const retryCallHandler =
+    isDirectConversation && typeof startVideoCall === "function"
+      ? () => startVideoCall(selectedUser)
+      : undefined;
   return (
-    <div className="relative flex h-full flex-col">
+    <div className="relative flex h-full min-h-0 flex-col">
       <ChatHeader
         onToggleSearch={handleToggleSearch}
         isSearchOpen={isSearchOpen}
         matchCount={textMatches.length}
         activeMatchIndex={activeMatchIndex}
         onShowProfile={() => setIsContactProfileOpen(true)}
+        onBackToList={onBackToList}
+        onMenuClearChat={handleMenuClearChat}
+        onMenuToggleBlock={handleMenuToggleBlock}
+        onMenuOpenTheme={handleMenuOpenTheme}
+        isSelectedUserBlocked={isSelectedUserBlocked}
       />
       {selectedUser.isGroup && <GroupInfoBar group={selectedUser} />}
       {isSearchOpen && (
@@ -681,7 +907,11 @@ function ChatContainer() {
         </div>
       )}
 
-      <div ref={messageListRef} className="flex-1 px-6 overflow-y-auto py-8" onScroll={handleScroll}>
+      <div
+        ref={messageListRef}
+        className="flex-1 min-h-0 px-6 overflow-y-auto overscroll-contain py-8"
+        onScroll={handleScroll}
+      >
         {messages.length > 0 && !isMessagesLoading ? (
           <div className="max-w-3xl mx-auto space-y-6">
             {messages.map((msg, index) => {
@@ -694,12 +924,22 @@ function ChatContainer() {
               const showDateDivider = !prevDate || !isSameDay(prevDate, msgDate);
               const isMatchedMessage = matchIdSet.has(msg._id);
               const isActiveMatch = activeMatchId === msg._id;
-              const shouldShowStatus = isOwnMessage && !selectedUser.isGroup;
+              const isCallEntry = isCallMessage(msg);
+              const shouldShowStatus = isOwnMessage && !selectedUser.isGroup && !isCallEntry;
               const isEditable =
+                !isCallEntry &&
                 isOwnMessage &&
                 !selectedUser.isGroup &&
+                !msg.poll &&
                 Date.now() - new Date(msg.createdAt).getTime() <= EDIT_WINDOW_MS;
-              const hasAttachments = Boolean(msg.image || msg.audio || msg.file);
+              const hasAttachments = !isCallEntry && Boolean(msg.image || msg.video || msg.audio || msg.file);
+              const pollOptions = msg.poll?.options || [];
+              const myPollSelections = msg.poll ? getPollSelectionsForUser(msg.poll, myUserId) : [];
+              const reactionSummary = buildReactionSummary(msg.reactions || [], myUserId);
+              const hasReactions = reactionSummary.length > 0;
+              const isReactionPickerOpen = reactionPickerMessageId === msg._id;
+              const isReactionPickerClosing = closingReactionPickerMessageId === msg._id;
+              const canReact = !msg.isOptimistic && !String(msg._id || "").startsWith("temp-");
 
               return (
                 <div key={msg._id} className="space-y-3">
@@ -729,8 +969,41 @@ function ChatContainer() {
                             ? "ring-2 ring-amber-300/60 shadow-amber-400/30"
                             : ""
                         } ${isActiveMatch ? "scale-[1.01]" : ""}`}
+                        onDoubleClick={(event) => {
+                          if (!canReact) return;
+                          if (event.target?.closest?.("button,a,input,textarea,select,video,audio")) {
+                            return;
+                          }
+                          handleBubbleDoubleTap(msg._id);
+                        }}
+                        onTouchEnd={(event) => {
+                          if (!canReact) return;
+                          handleBubbleTouchEnd(event, msg._id);
+                        }}
                       >
-                        {isEditable && (
+                        {(isReactionPickerOpen || isReactionPickerClosing) && !isCallEntry && canReact && (
+                          <div
+                            className={`reaction-picker-tray ${
+                              isReactionPickerClosing ? "reaction-picker-tray-closing" : ""
+                            } absolute -top-14 z-20 flex items-center gap-1 rounded-full border border-slate-600/70 bg-slate-900/95 px-2 py-1 shadow-2xl ${
+                              isOwnMessage ? "right-0" : "left-0"
+                            }`}
+                          >
+                            {QUICK_REACTIONS.map((emoji, idx) => (
+                              <button
+                                key={`${msg._id}-${emoji}`}
+                                type="button"
+                                onClick={() => handleApplyReaction(msg._id, emoji)}
+                                className="reaction-picker-emoji rounded-full px-2 py-1 text-lg transition hover:bg-slate-700/70"
+                                style={{ animationDelay: isReactionPickerClosing ? "0ms" : `${idx * 36}ms` }}
+                                aria-label={`React ${emoji}`}
+                              >
+                                {emoji}
+                              </button>
+                            ))}
+                          </div>
+                        )}
+                        {isEditable && !isCallEntry && (
                           <button
                             type="button"
                             onClick={() => setEditingMessage(msg)}
@@ -740,75 +1013,179 @@ function ChatContainer() {
                             <PencilIcon className="w-3.5 h-3.5" />
                           </button>
                         )}
-                        <button
-                          type="button"
-                          onClick={() => handleOpenForwardModal(msg)}
-                          className="absolute -top-3 left-2 rounded-full bg-slate-900/60 p-1 text-xs text-white/80 hover:bg-slate-800"
-                          aria-label="Forward message"
-                        >
-                          <CornerUpRightIcon className="w-3.5 h-3.5" />
-                        </button>
+                        {!isCallEntry && (
+                          <button
+                            type="button"
+                            onClick={() => handleOpenForwardModal(msg)}
+                            className="absolute -top-3 left-2 rounded-full bg-slate-900/60 p-1 text-xs text-white/80 hover:bg-slate-800"
+                            aria-label="Forward message"
+                          >
+                            <CornerUpRightIcon className="w-3.5 h-3.5" />
+                          </button>
+                        )}
                         {isGroupChat && !isOwnMessage && (
                           <p className="text-xs font-semibold text-slate-200/80 mb-1">
                             {msg.sender?.fullName || "Member"}
                           </p>
                         )}
-                        {msg.image && (
-                          <img
-                            src={msg.image}
-                            alt="Shared"
-                            className="rounded-xl max-h-60 w-full object-cover"
+                        {isCallEntry ? (
+                          <CallLogEntry
+                            metadata={msg.callMetadata || {}}
+                            authUserId={myUserId}
+                            onCallAgain={retryCallHandler}
+                            disableCallAgain={!canRetryCall}
                           />
-                        )}
-                        {msg.audio && (
-                          <div className="mt-2">
-                            <VoiceMessagePlayer
-                              src={msg.audio}
-                              duration={msg.audioDuration}
-                              intent={isOwnMessage ? "light" : "dark"}
-                            />
-                          </div>
-                        )}
-                        {msg.file && (
-                          <button
-                            type="button"
-                            onClick={() => handleFileDownload(msg)}
-                            disabled={downloadingFileId === msg._id}
-                            className={`mt-2 flex w-full items-center justify-between gap-3 rounded-lg border px-3 py-2 text-sm transition ${
-                              isOwnMessage
-                                ? "border-white/30 bg-white/10"
-                                : "border-slate-600/60 bg-slate-900/40"
-                            } ${
-                              downloadingFileId === msg._id
-                                ? "opacity-70 cursor-wait"
-                                : "hover:border-cyan-400/60"
-                            }`}
-                            aria-busy={downloadingFileId === msg._id}
-                          >
-                            <div className="flex items-center gap-3">
-                              <FileTextIcon className="w-4 h-4 text-amber-300" />
-                              <div className="text-left">
-                                <p className="font-medium truncate max-w-xs">
-                                  {msg.fileName || "Shared file"}
+                        ) : msg.poll ? (
+                          <div className="space-y-3">
+                            <div className="flex items-center justify-between gap-3">
+                              <div>
+                                <p className="font-semibold text-base">{msg.poll.question}</p>
+                                <p className="text-xs text-slate-200/70">
+                                  {msg.poll.allowMultiple ? "Multiple answers" : "Single answer"} • {msg.poll.totalVotes || 0} votes
                                 </p>
-                                {msg.fileSize && (
-                                  <p className="text-xs opacity-70">{formatFileSize(msg.fileSize)}</p>
-                                )}
                               </div>
+                              {pollVoteBusyId === msg._id && (
+                                <Loader2Icon className="h-4 w-4 animate-spin text-cyan-200" />
+                              )}
                             </div>
-                            {downloadingFileId === msg._id ? (
-                              <Loader2Icon className="w-4 h-4 animate-spin opacity-70" />
-                            ) : (
-                              <DownloadIcon className="w-4 h-4 opacity-70" />
+                            <div className="space-y-2">
+                              {pollOptions.map((option) => {
+                                const optionId = option?._id?.toString?.() || option?._id || option?.label;
+                                const voteCount = option.voteCount ?? option.voters?.length ?? 0;
+                                const percentage = msg.poll.totalVotes
+                                  ? Math.round((voteCount / msg.poll.totalVotes) * 100)
+                                  : 0;
+                                const isSelected = myPollSelections.includes(optionId);
+                                const voterNames = (option.voters || []).map((voter) => voter?.fullName || "Member");
+
+                                return (
+                                  <button
+                                    key={optionId}
+                                    type="button"
+                                    onClick={() => handlePollOptionToggle(msg, optionId)}
+                                    disabled={pollVoteBusyId === msg._id}
+                                    className={`w-full rounded-2xl border px-3 py-2 text-left text-sm transition ${
+                                      isSelected
+                                        ? "border-cyan-400/70 bg-cyan-500/10"
+                                        : "border-slate-600/60 bg-slate-900/40 hover:border-cyan-400/40"
+                                    } ${pollVoteBusyId === msg._id ? "opacity-70 cursor-wait" : ""}`}
+                                  >
+                                    <div className="flex items-center justify-between text-[13px] font-semibold">
+                                      <span>{option.label}</span>
+                                      <span>
+                                        {voteCount} · {percentage}%
+                                      </span>
+                                    </div>
+                                    <div className="mt-2 h-1.5 rounded-full bg-slate-700/60">
+                                      <div
+                                        className={`h-full rounded-full ${isSelected ? "bg-cyan-400" : "bg-slate-500/80"}`}
+                                        style={{ width: `${msg.poll.totalVotes ? Math.max(5, percentage) : 5}%` }}
+                                      />
+                                    </div>
+                                    <p className="mt-1 text-[11px] text-slate-400">
+                                      {voterNames.length ? voterNames.join(", ") : "No votes yet"}
+                                    </p>
+                                  </button>
+                                );
+                              })}
+                            </div>
+                          </div>
+                        ) : (
+                          <>
+                            {msg.image && (
+                              <img
+                                src={msg.image}
+                                alt="Shared"
+                                className="rounded-xl max-h-60 w-full object-cover"
+                              />
                             )}
-                          </button>
-                        )}
-                        {msg.text && (
-                          <p className={`${hasAttachments ? "pt-1" : ""} whitespace-pre-wrap break-words`}>
-                            {isMatchedMessage && normalizedQuery ? highlightText(msg.text) : msg.text}
-                          </p>
+                            {msg.video && (
+                              <video
+                                src={msg.video}
+                                controls
+                                className="mt-2 w-full rounded-xl border border-slate-600/60 bg-black"
+                              />
+                            )}
+                            {msg.audio && (
+                              <div className="mt-2">
+                                <VoiceMessagePlayer
+                                  src={msg.audio}
+                                  duration={msg.audioDuration}
+                                  intent={isOwnMessage ? "light" : "dark"}
+                                />
+                              </div>
+                            )}
+                            {msg.file && (
+                              <button
+                                type="button"
+                                onClick={() => handleFileDownload(msg)}
+                                disabled={downloadingFileId === msg._id}
+                                className={`mt-2 flex w-full items-center justify-between gap-3 rounded-lg border px-3 py-2 text-sm transition ${
+                                  isOwnMessage
+                                    ? "border-white/30 bg-white/10"
+                                    : "border-slate-600/60 bg-slate-900/40"
+                                } ${
+                                  downloadingFileId === msg._id
+                                    ? "opacity-70 cursor-wait"
+                                    : "hover:border-cyan-400/60"
+                                }`}
+                                aria-busy={downloadingFileId === msg._id}
+                              >
+                                <div className="flex items-center gap-3">
+                                  <FileTextIcon className="w-4 h-4 text-amber-300" />
+                                  <div className="text-left">
+                                    <p className="font-medium truncate max-w-xs">
+                                      {msg.fileName || "Shared file"}
+                                    </p>
+                                    {msg.fileSize && (
+                                      <p className="text-xs opacity-70">{formatFileSize(msg.fileSize)}</p>
+                                    )}
+                                  </div>
+                                </div>
+                                {downloadingFileId === msg._id ? (
+                                  <Loader2Icon className="w-4 h-4 animate-spin opacity-70" />
+                                ) : (
+                                  <DownloadIcon className="w-4 h-4 opacity-70" />
+                                )}
+                              </button>
+                            )}
+                            {msg.text && (
+                              <p className={`${hasAttachments ? "pt-1" : ""} whitespace-pre-wrap break-words`}>
+                                {isMatchedMessage && normalizedQuery ? highlightText(msg.text) : msg.text}
+                              </p>
+                            )}
+                          </>
                         )}
                       </div>
+                      {hasReactions && !isCallEntry && canReact && (
+                        <div
+                          className={`mt-1 flex flex-wrap gap-1 ${
+                            isOwnMessage ? "justify-end" : "justify-start"
+                          }`}
+                        >
+                          {reactionSummary.map((reaction) => (
+                            <button
+                              key={`${msg._id}-reaction-${reaction.emoji}`}
+                              type="button"
+                              onClick={() =>
+                                handleApplyReaction(
+                                  msg._id,
+                                  reaction.reactedByMe ? "" : reaction.emoji
+                                )
+                              }
+                              className={`rounded-full border px-2 py-0.5 text-xs font-semibold transition ${
+                                reaction.reactedByMe
+                                  ? "border-cyan-300/80 bg-cyan-500/20 text-cyan-100"
+                                  : "border-slate-600/70 bg-slate-900/60 text-slate-200 hover:border-cyan-400/60"
+                              }`}
+                              aria-label={`Reaction ${reaction.emoji}`}
+                            >
+                              <span>{reaction.emoji}</span>
+                              <span className="ml-1">{reaction.count}</span>
+                            </button>
+                          ))}
+                        </div>
+                      )}
                       <p
                         className={`text-xs flex items-center gap-1 opacity-70 ${
                           isOwnMessage ? "justify-end text-white/80" : "text-slate-400"

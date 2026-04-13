@@ -121,6 +121,22 @@ const updateCollectionWithMessage = (items = [], itemId, message) => {
   return updated ? sortByLastMessage(nextItems) : items;
 };
 
+const updateCollectionWithPresence = (items = [], userId, presencePayload = {}) => {
+  if (!userId) return items;
+  let changed = false;
+  const nextItems = items.map((item) => {
+    if (normalizeId(item?._id) !== userId) return item;
+    changed = true;
+    return {
+      ...item,
+      isOnline: Boolean(presencePayload.isOnline),
+      lastSeenAt: presencePayload.lastSeenAt ?? null,
+      isLastSeenVisible: presencePayload.isLastSeenVisible !== false,
+    };
+  });
+  return changed ? nextItems : items;
+};
+
 const enhanceGroup = (group) => {
   if (!group) return group;
   const memberCount = group.members?.length ?? group.memberCount ?? 0;
@@ -130,6 +146,48 @@ const enhanceGroup = (group) => {
     fullName: group.fullName || group.name || "Untitled group",
     isGroup: true,
     memberCount,
+  };
+};
+
+const normalizePollOptionsInput = (options = []) => {
+  if (!Array.isArray(options)) return [];
+  const seen = new Set();
+  return options
+    .map((option) => (typeof option === "string" ? option.trim() : option?.label?.trim?.() || ""))
+    .filter((label) => {
+      if (!label) return false;
+      const lowercase = label.toLowerCase();
+      if (seen.has(lowercase)) return false;
+      seen.add(lowercase);
+      return true;
+    });
+};
+
+const sanitizePollRequestPayload = (poll) => {
+  if (!poll) return null;
+  const question = poll.question?.trim();
+  if (!question) return null;
+  const options = normalizePollOptionsInput(poll.options);
+  if (options.length < 2) return null;
+  return {
+    question,
+    options,
+    allowMultiple: Boolean(poll.allowMultiple),
+  };
+};
+
+const buildOptimisticPollSnapshot = (poll, tempIdPrefix = "") => {
+  const payload = sanitizePollRequestPayload(poll);
+  if (!payload) return null;
+  return {
+    ...payload,
+    options: payload.options.map((label, index) => ({
+      _id: `${tempIdPrefix}poll-opt-${index}`,
+      label,
+      voters: [],
+      voteCount: 0,
+    })),
+    totalVotes: 0,
   };
 };
 
@@ -509,10 +567,72 @@ export const useChatStore = create((set, get) => ({
     }
   },
 
+  clearConversation: async (userId) => {
+    const selectedUser = get().selectedUser;
+    const normalizedTargetId = normalizeId(userId || selectedUser?._id);
+    if (!normalizedTargetId) {
+      toast.error("Select a conversation first");
+      return false;
+    }
+
+    try {
+      await axiosInstance.delete(`/messages/${normalizedTargetId}/clear`);
+
+      set((state) => {
+        const updates = {
+          chats: state.chats.map((chat) =>
+            normalizeId(chat._id) === normalizedTargetId ? { ...chat, lastMessage: null } : chat
+          ),
+        };
+
+        if (
+          state.selectedUser &&
+          !state.selectedUser.isGroup &&
+          normalizeId(state.selectedUser._id) === normalizedTargetId
+        ) {
+          const refreshedSelection = { ...state.selectedUser, lastMessage: null };
+          updates.selectedUser = refreshedSelection;
+          updates.messages = [];
+          updates.messagePageInfo = EMPTY_PAGE_INFO;
+          localStorage.setItem("chatSelectedUser", JSON.stringify(refreshedSelection));
+        }
+
+        return updates;
+      });
+
+      toast.success("Chat cleared");
+      return true;
+    } catch (error) {
+      toast.error(error.response?.data?.message || "Unable to clear chat");
+      return false;
+    }
+  },
+
   sendMessage: async (messageData) => {
     const { selectedUser, isSoundEnabled } = get();
     if (!selectedUser?._id) {
       toast.error("Select a conversation first");
+      return;
+    }
+
+    if (!selectedUser.isGroup && messageData?.poll) {
+      toast.error("Polls can only be sent in group chats");
+      return;
+    }
+
+    const authSnapshot = useAuthStore.getState().authUser;
+    const blockedByMe = new Set((authSnapshot?.blockedUsers || []).map((id) => normalizeId(id)));
+    if (!selectedUser.isGroup && blockedByMe.has(normalizeId(selectedUser._id))) {
+      toast.error("Unblock this contact to send messages");
+      return;
+    }
+
+    const pollPayload = selectedUser.isGroup
+      ? sanitizePollRequestPayload(messageData?.poll)
+      : null;
+
+    if (messageData?.poll && !pollPayload) {
+      toast.error("Polls need a question and at least two options");
       return;
     }
 
@@ -522,18 +642,21 @@ export const useChatStore = create((set, get) => ({
 
     const { authUser } = useAuthStore.getState();
     const tempId = `temp-${Date.now()}`;
+    const optimisticPoll = buildOptimisticPollSnapshot(messageData?.poll, `${tempId}-`);
 
     const optimisticMessage = {
       _id: tempId,
       senderId: authUser._id,
       text: messageData.text,
       image: messageData.image,
+      video: messageData.video,
       audio: messageData.audio,
       audioDuration: messageData.audioDuration,
       file: messageData.file,
       fileName: messageData.fileName,
       fileSize: messageData.fileSize,
       fileType: messageData.fileType,
+      poll: optimisticPoll,
       createdAt: new Date().toISOString(),
       status: "sending",
       isOptimistic: true,
@@ -551,7 +674,13 @@ export const useChatStore = create((set, get) => ({
       const url = selectedUser.isGroup
         ? `/groups/${selectedUser._id}/messages`
         : `/messages/send/${selectedUser._id}`;
-      const res = await axiosInstance.post(url, messageData);
+      const requestPayload = { ...messageData };
+      if (pollPayload) {
+        requestPayload.poll = pollPayload;
+      } else {
+        delete requestPayload.poll;
+      }
+      const res = await axiosInstance.post(url, requestPayload);
       set((state) => ({
         messages: state.messages.map((msg) => (msg._id === tempId ? res.data : msg)),
         messagePageInfo: state.messagePageInfo
@@ -685,6 +814,62 @@ export const useChatStore = create((set, get) => ({
     }
   },
 
+  voteOnPoll: async ({ groupId, messageId, optionIds = [] }) => {
+    const normalizedGroupId = normalizeId(groupId);
+    if (!normalizedGroupId || !messageId) {
+      toast.error("Select a poll option to vote");
+      return null;
+    }
+
+    try {
+      const res = await axiosInstance.post(
+        `/groups/${normalizedGroupId}/messages/${messageId}/poll/vote`,
+        { optionIds }
+      );
+      const updatedMessage = res.data;
+
+      set((state) => {
+        const updates = {};
+        const updatedMessageId = normalizeId(updatedMessage._id);
+        const hasTargetMessage = state.messages.some((msg) => normalizeId(msg._id) === updatedMessageId);
+        if (hasTargetMessage) {
+          updates.messages = state.messages.map((msg) =>
+            normalizeId(msg._id) === updatedMessageId ? updatedMessage : msg
+          );
+        }
+
+        const nextGroups = updateCollectionWithMessage(state.groups, normalizedGroupId, updatedMessage);
+        if (nextGroups !== state.groups) {
+          updates.groups = nextGroups;
+        }
+
+        const isActiveGroup =
+          state.selectedUser?.isGroup &&
+          normalizeId(state.selectedUser._id) === normalizedGroupId;
+        if (isActiveGroup && state.selectedUser) {
+          let nextSelectedUser = state.selectedUser;
+          if (
+            state.selectedUser.lastMessage &&
+            normalizeId(state.selectedUser.lastMessage._id) === updatedMessageId
+          ) {
+            nextSelectedUser = { ...state.selectedUser, lastMessage: updatedMessage };
+          }
+          if (nextSelectedUser !== state.selectedUser) {
+            updates.selectedUser = nextSelectedUser;
+            localStorage.setItem("chatSelectedUser", JSON.stringify(nextSelectedUser));
+          }
+        }
+
+        return Object.keys(updates).length ? updates : {};
+      });
+
+      return updatedMessage;
+    } catch (error) {
+      toast.error(error.response?.data?.message || "Unable to update poll vote");
+      return null;
+    }
+  },
+
   markConversationAsRead: async (partnerId) => {
     const normalizedPartnerId = normalizeId(partnerId);
     if (!normalizedPartnerId) return;
@@ -779,6 +964,66 @@ export const useChatStore = create((set, get) => ({
     } catch (error) {
       toast.error(error.response?.data?.message || "Unable to update message");
       return false;
+    }
+  },
+
+  reactToMessage: async ({ messageId, emoji }) => {
+    const { selectedUser } = get();
+    if (!selectedUser?._id || !messageId) return null;
+
+    try {
+      const url = selectedUser.isGroup
+        ? `/groups/${selectedUser._id}/messages/${messageId}/reaction`
+        : `/messages/${messageId}/reaction`;
+      const res = await axiosInstance.post(url, { emoji: emoji || "" });
+      const updatedMessage = res.data;
+      const updatedMessageId = normalizeId(updatedMessage?._id);
+      if (!updatedMessageId) return null;
+
+      set((state) => {
+        const updates = {};
+        const hasTargetMessage = state.messages.some(
+          (msg) => normalizeId(msg._id) === updatedMessageId
+        );
+        if (hasTargetMessage) {
+          updates.messages = state.messages.map((msg) =>
+            normalizeId(msg._id) === updatedMessageId ? updatedMessage : msg
+          );
+        }
+
+        const collectionId = normalizeId(selectedUser._id);
+        if (selectedUser.isGroup) {
+          const nextGroups = updateCollectionWithMessage(state.groups, collectionId, updatedMessage);
+          if (nextGroups !== state.groups) {
+            updates.groups = nextGroups;
+          }
+        } else {
+          const nextChats = updateCollectionWithMessage(state.chats, collectionId, updatedMessage);
+          if (nextChats !== state.chats) {
+            updates.chats = nextChats;
+          }
+        }
+
+        const isSelectedConversation =
+          state.selectedUser &&
+          normalizeId(state.selectedUser._id) === collectionId &&
+          (!!state.selectedUser.isGroup === !!selectedUser.isGroup);
+
+        if (isSelectedConversation && state.selectedUser?.lastMessage) {
+          if (normalizeId(state.selectedUser.lastMessage._id) === updatedMessageId) {
+            const nextSelected = { ...state.selectedUser, lastMessage: updatedMessage };
+            updates.selectedUser = nextSelected;
+            localStorage.setItem("chatSelectedUser", JSON.stringify(nextSelected));
+          }
+        }
+
+        return Object.keys(updates).length ? updates : {};
+      });
+
+      return updatedMessage;
+    } catch (error) {
+      toast.error(error.response?.data?.message || "Unable to react to message");
+      return null;
     }
   },
 
@@ -894,31 +1139,224 @@ export const useChatStore = create((set, get) => ({
       });
     };
 
-    socket.on("newMessage", (newMessage) => {
+    const handleMessageUpdated = (updatedMessage = {}) => {
+      if (!updatedMessage?._id) return;
+      const authState = useAuthStore.getState();
+      const myId = normalizeId(authState.authUser?._id);
+      const senderId = normalizeId(updatedMessage.senderId);
+      const receiverId = normalizeId(updatedMessage.receiverId);
+      const partnerId = senderId === myId ? receiverId : senderId;
+      if (!partnerId) return;
+
+      const targetMessageId = normalizeId(updatedMessage._id);
+
+      set((state) => {
+        const updates = {};
+        const isActiveConversation =
+          state.selectedUser &&
+          !state.selectedUser.isGroup &&
+          normalizeId(state.selectedUser._id) === partnerId;
+
+        if (isActiveConversation && state.messages.length) {
+          let changed = false;
+          const nextMessages = state.messages.map((message) => {
+            if (normalizeId(message._id) !== targetMessageId) return message;
+            changed = true;
+            return { ...message, ...updatedMessage };
+          });
+          if (changed) {
+            updates.messages = nextMessages;
+          }
+        }
+
+        const nextChats = updateCollectionWithMessage(state.chats, partnerId, updatedMessage);
+        if (nextChats !== state.chats) {
+          updates.chats = nextChats;
+        }
+
+        if (
+          state.selectedUser?.lastMessage &&
+          normalizeId(state.selectedUser.lastMessage._id) === targetMessageId
+        ) {
+          const nextSelected = {
+            ...state.selectedUser,
+            lastMessage: updatedMessage,
+          };
+          updates.selectedUser = nextSelected;
+          localStorage.setItem("chatSelectedUser", JSON.stringify(nextSelected));
+        }
+
+        return Object.keys(updates).length ? updates : {};
+      });
+    };
+
+    const handleGroupMessageUpdated = (updatedMessage = {}) => {
+      const groupId = normalizeId(updatedMessage.groupId);
+      const targetMessageId = normalizeId(updatedMessage._id);
+      if (!groupId || !targetMessageId) return;
+
+      set((state) => {
+        const updates = {};
+        const isActiveGroup =
+          state.selectedUser?.isGroup && normalizeId(state.selectedUser._id) === groupId;
+
+        if (isActiveGroup && state.messages.length) {
+          let changed = false;
+          const nextMessages = state.messages.map((message) => {
+            if (normalizeId(message._id) !== targetMessageId) return message;
+            changed = true;
+            return updatedMessage;
+          });
+          if (changed) {
+            updates.messages = nextMessages;
+          }
+        }
+
+        const nextGroups = updateCollectionWithMessage(state.groups, groupId, updatedMessage);
+        if (nextGroups !== state.groups) {
+          updates.groups = nextGroups;
+        }
+
+        const lastMessageMatches =
+          state.selectedUser?.isGroup &&
+          normalizeId(state.selectedUser._id) === groupId &&
+          state.selectedUser.lastMessage &&
+          normalizeId(state.selectedUser.lastMessage._id) === targetMessageId;
+
+        if (lastMessageMatches) {
+          const nextSelected = { ...state.selectedUser, lastMessage: updatedMessage };
+          updates.selectedUser = nextSelected;
+          localStorage.setItem("chatSelectedUser", JSON.stringify(nextSelected));
+        }
+
+        return Object.keys(updates).length ? updates : {};
+      });
+    };
+
+    const handleGroupNewMessage = (newMessage = {}) => {
+      const groupId = normalizeId(newMessage.groupId);
+      if (!groupId || !newMessage._id) return;
+
+      const authState = useAuthStore.getState();
+      const myId = normalizeId(authState.authUser?._id);
+      const senderId = normalizeId(newMessage.senderId || newMessage.sender?._id);
+      const isOwnMessage = myId && senderId === myId;
       const { selectedUser: currentSelectedUser, isSoundEnabled } = get();
+
+      const isActiveGroup =
+        currentSelectedUser?.isGroup && normalizeId(currentSelectedUser._id) === groupId;
+
+      set((state) => {
+        const updates = {};
+        if (isActiveGroup) {
+          const targetMessageId = normalizeId(newMessage._id);
+          const existingIndex = state.messages.findIndex(
+            (msg) => normalizeId(msg._id) === targetMessageId
+          );
+          if (existingIndex >= 0) {
+            const nextMessages = state.messages.map((msg, index) =>
+              index === existingIndex ? newMessage : msg
+            );
+            updates.messages = nextMessages;
+          } else {
+            updates.messages = [...state.messages, newMessage];
+            if (state.messagePageInfo) {
+              updates.messagePageInfo = {
+                ...state.messagePageInfo,
+                newestCursor: newMessage.createdAt,
+                hasNewer: false,
+              };
+            }
+          }
+
+          if (!isOwnMessage) {
+            const conversationKey = getConversationKey({ _id: groupId, isGroup: true });
+            if (conversationKey) {
+              const { map, changed } = updateSeenMapEntry(
+                state.conversationSeenAt,
+                conversationKey,
+                newMessage.createdAt || new Date().toISOString()
+              );
+              if (changed) {
+                persistSeenMapIfNeeded(map, changed);
+                updates.conversationSeenAt = map;
+              }
+            }
+          }
+        }
+
+        const nextGroups = updateCollectionWithMessage(state.groups, groupId, newMessage);
+        if (nextGroups !== state.groups) {
+          updates.groups = nextGroups;
+        }
+
+        if (isActiveGroup && state.selectedUser) {
+          const nextSelected = { ...state.selectedUser, lastMessage: newMessage };
+          updates.selectedUser = nextSelected;
+          localStorage.setItem("chatSelectedUser", JSON.stringify(nextSelected));
+        }
+
+        if (!isActiveGroup && !isOwnMessage) {
+          const conversationKey = getConversationKey({ _id: groupId, isGroup: true });
+          if (conversationKey) {
+            const { map, changed } = updateUnreadCountEntry(
+              state.conversationUnreadCounts,
+              conversationKey,
+              (prev) => prev + 1
+            );
+            if (changed) {
+              persistUnreadMapIfNeeded(map, changed);
+              updates.conversationUnreadCounts = map;
+            }
+          }
+        }
+
+        return Object.keys(updates).length ? updates : {};
+      });
+
+      if (!isOwnMessage && isSoundEnabled) {
+        chatSoundEngine.playIncoming();
+      }
+    };
+
+    socket.on("newMessage", (newMessage) => {
+      if (newMessage?.groupId) {
+        return;
+      }
+      const { selectedUser: currentSelectedUser, isSoundEnabled } = get();
+      const authState = useAuthStore.getState();
+      const myId = normalizeId(authState.authUser?._id);
       const senderId = normalizeId(newMessage.senderId);
-      const isActiveDirectConversation =
+      const receiverId = normalizeId(newMessage.receiverId);
+      const partnerId = senderId && senderId === myId ? receiverId : senderId;
+      const isCallMessage =
+        newMessage.messageType === "call" || Boolean(newMessage.callMetadata);
+      const matchesSelectedConversation =
         currentSelectedUser &&
         !currentSelectedUser.isGroup &&
-        normalizeId(currentSelectedUser._id) === senderId;
+        partnerId &&
+        normalizeId(currentSelectedUser._id) === partnerId;
+      const shouldAppendToOpenChat = matchesSelectedConversation && (senderId !== myId || isCallMessage);
 
-      if (isActiveDirectConversation) {
+      if (shouldAppendToOpenChat) {
         set((state) => ({
           messages: [...state.messages, newMessage],
           messagePageInfo: state.messagePageInfo
             ? { ...state.messagePageInfo, newestCursor: newMessage.createdAt, hasNewer: false }
             : state.messagePageInfo,
         }));
-        get().markConversationAsRead(senderId);
+        if (senderId !== myId && partnerId) {
+          get().markConversationAsRead(partnerId);
+        }
       }
 
       set((state) => {
         const updates = {
-          chats: updateCollectionWithMessage(state.chats, senderId, newMessage),
+          chats: updateCollectionWithMessage(state.chats, partnerId, newMessage),
         };
 
-        if (!isActiveDirectConversation) {
-          const conversationKey = getConversationKey(senderId, false);
+        if (!matchesSelectedConversation && partnerId && senderId !== myId) {
+          const conversationKey = getConversationKey(partnerId, false);
           const { map, changed } = updateUnreadCountEntry(
             state.conversationUnreadCounts,
             conversationKey,
@@ -933,10 +1371,13 @@ export const useChatStore = create((set, get) => ({
         return updates;
       });
 
-      if (isSoundEnabled) {
+      if (isSoundEnabled && senderId !== myId) {
         chatSoundEngine.playIncoming();
       }
     });
+
+    socket.on("group:newMessage", handleGroupNewMessage);
+    socket.on("group:messageUpdated", handleGroupMessageUpdated);
 
     socket.on("messagesDelivered", ({ messageIds = [], deliveredAt }) => {
       updateMessageStatuses(messageIds, { status: "delivered", deliveredAt });
@@ -948,13 +1389,174 @@ export const useChatStore = create((set, get) => ({
         readAt,
       });
     });
+
+    socket.on("messageUpdated", handleMessageUpdated);
+
+    socket.on("user:profileUpdated", ({ _id, id, profilePic }) => {
+      const targetId = normalizeId(_id || id);
+      if (!targetId) return;
+      const nextPic = profilePic || "";
+
+      set((state) => {
+        const patchUserEntry = (entry) => {
+          if (!entry || normalizeId(entry._id) !== targetId) return entry;
+          if ((entry.profilePic || "") === nextPic) return entry;
+          return { ...entry, profilePic: nextPic };
+        };
+
+        const patchCollection = (collection = []) => {
+          let changed = false;
+          const nextCollection = collection.map((item) => {
+            const patched = patchUserEntry(item);
+            if (patched !== item) changed = true;
+            return patched;
+          });
+          return changed ? nextCollection : collection;
+        };
+
+        const patchGroupMembers = (group) => {
+          if (!Array.isArray(group?.members) || !group.members.length) return group;
+          let memberChanged = false;
+          const nextMembers = group.members.map((member) => {
+            if (!member || normalizeId(member._id || member.id) !== targetId) return member;
+            memberChanged = true;
+            return { ...member, profilePic: nextPic };
+          });
+          if (!memberChanged) return group;
+          return { ...group, members: nextMembers };
+        };
+
+        const updates = {};
+        const nextContacts = patchCollection(state.allContacts);
+        if (nextContacts !== state.allContacts) {
+          updates.allContacts = nextContacts;
+        }
+
+        const nextChats = patchCollection(state.chats);
+        if (nextChats !== state.chats) {
+          updates.chats = nextChats;
+        }
+
+        const nextGroups = state.groups.map(patchGroupMembers);
+        const groupsChanged = nextGroups.some((group, idx) => group !== state.groups[idx]);
+        if (groupsChanged) {
+          updates.groups = nextGroups;
+        }
+
+        if (state.selectedUser && !state.selectedUser.isGroup) {
+          const patchedSelected = patchUserEntry(state.selectedUser);
+          if (patchedSelected !== state.selectedUser) {
+            updates.selectedUser = patchedSelected;
+            localStorage.setItem("chatSelectedUser", JSON.stringify(patchedSelected));
+          }
+        }
+
+        if (state.messages.some((message) => message?.sender && normalizeId(message.sender._id) === targetId)) {
+          updates.messages = state.messages.map((message) => {
+            if (message?.sender && normalizeId(message.sender._id) === targetId) {
+              return {
+                ...message,
+                sender: {
+                  ...message.sender,
+                  profilePic: nextPic,
+                },
+              };
+            }
+            return message;
+          });
+        }
+
+        return Object.keys(updates).length ? updates : {};
+      });
+
+      const authState = useAuthStore.getState();
+      if (normalizeId(authState.authUser?._id) === targetId) {
+        useAuthStore.setState((prev) => {
+          if (!prev.authUser || (prev.authUser.profilePic || "") === nextPic) {
+            return {};
+          }
+          return {
+            authUser: {
+              ...prev.authUser,
+              profilePic: nextPic,
+            },
+          };
+        });
+      }
+    });
+
+    socket.on("user:presenceUpdated", ({ _id, id, isOnline, lastSeenAt, isLastSeenVisible }) => {
+      const targetId = normalizeId(_id || id);
+      if (!targetId) return;
+
+      const presencePayload = {
+        isOnline,
+        lastSeenAt,
+        isLastSeenVisible,
+      };
+
+      set((state) => {
+        const updates = {};
+
+        const nextContacts = updateCollectionWithPresence(
+          state.allContacts,
+          targetId,
+          presencePayload
+        );
+        if (nextContacts !== state.allContacts) {
+          updates.allContacts = nextContacts;
+        }
+
+        const nextChats = updateCollectionWithPresence(state.chats, targetId, presencePayload);
+        if (nextChats !== state.chats) {
+          updates.chats = nextChats;
+        }
+
+        if (
+          state.selectedUser &&
+          !state.selectedUser.isGroup &&
+          normalizeId(state.selectedUser._id) === targetId
+        ) {
+          const nextSelected = {
+            ...state.selectedUser,
+            isOnline: Boolean(isOnline),
+            lastSeenAt: lastSeenAt ?? null,
+            isLastSeenVisible: isLastSeenVisible !== false,
+          };
+          updates.selectedUser = nextSelected;
+          localStorage.setItem("chatSelectedUser", JSON.stringify(nextSelected));
+        }
+
+        return Object.keys(updates).length ? updates : {};
+      });
+
+      const authState = useAuthStore.getState();
+      if (normalizeId(authState.authUser?._id) === targetId) {
+        useAuthStore.setState((prev) => {
+          if (!prev.authUser) return {};
+          return {
+            authUser: {
+              ...prev.authUser,
+              isOnline: Boolean(isOnline),
+              lastSeenAt: lastSeenAt ?? null,
+              isLastSeenVisible: isLastSeenVisible !== false,
+            },
+          };
+        });
+      }
+    });
   },
 
   unsubscribeFromMessages: () => {
     const socket = useAuthStore.getState().socket;
     if (!socket) return;
     socket.off("newMessage");
+    socket.off("group:newMessage");
+    socket.off("group:messageUpdated");
     socket.off("messagesDelivered");
     socket.off("messagesRead");
+    socket.off("user:profileUpdated");
+    socket.off("user:presenceUpdated");
+    socket.off("messageUpdated");
   },
 }));

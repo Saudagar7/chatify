@@ -14,13 +14,13 @@ function SignUpPage() {
   };
 
   return (
-    <div className="w-full flex items-center justify-center p-4 bg-slate-900">
-      <div className="relative w-full max-w-6xl md:h-[800px] h-[650px]">
-        <BorderAnimatedContainer>
-          <div className="w-full flex flex-col md:flex-row">
+    <div className="auth-page-shell w-full flex items-center justify-center bg-slate-900">
+      <div className="auth-page-card relative w-full max-w-6xl">
+        <BorderAnimatedContainer className="auth-page-surface">
+          <div className="w-full h-full flex flex-col md:flex-row">
             
-            <div className="md:w-1/2 p-8 flex items-center justify-center md:border-r border-slate-600/30">
-              <div className="w-full max-w-md">
+            <div className="auth-page-column md:w-1/2 md:border-r border-slate-600/30">
+              <div className="w-full max-w-md mx-auto">
                 
                 <div className="text-center mb-8">
                   <MessageCircleIcon className="w-12 h-12 mx-auto text-slate-400 mb-4" />
@@ -100,9 +100,10 @@ function SignUpPage() {
                   </button>
                 </form>
 
-                <div className="mt-6 text-center">
-                  <Link to="/login" className="auth-link">
-                    Already have an account? Login
+                <div className="auth-actions mt-8">
+                  <Link to="/login" className="auth-secondary-link">
+                    <span className="auth-secondary-link-title">Already have an account?</span>
+                    <span className="auth-secondary-link-cta">Log in</span>
                   </Link>
                 </div>
               </div>

@@ -17,6 +17,20 @@ const privacySettingsSchema = new mongoose.Schema(
             ],
             default: [],
         },
+        lastSeen: {
+            type: String,
+            enum: PRIVACY_VISIBILITY_OPTIONS,
+            default: 'everyone',
+        },
+        lastSeenExceptions: {
+            type: [
+                {
+                    type: mongoose.Schema.Types.ObjectId,
+                    ref: 'User',
+                },
+            ],
+            default: [],
+        },
     },
     { _id: false }
 );
@@ -47,9 +61,22 @@ const userSchema = new mongoose.Schema({
         type: String,
         default: "",
     },
+    lastSeenAt: {
+        type: Date,
+        default: Date.now,
+    },
     privacySettings: {
         type: privacySettingsSchema,
         default: () => ({}),
+    },
+    blockedUsers: {
+        type: [
+            {
+                type: mongoose.Schema.Types.ObjectId,
+                ref: 'User',
+            },
+        ],
+        default: [],
     },
 }, { timestamps: true });
 
