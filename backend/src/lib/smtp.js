@@ -1,54 +1,24 @@
-import nodemailer from "nodemailer";
+import { resendClient, sender } from "./resend.js";
 import { ENV } from "./env.js";
 
-let transporter = null;
-
-const normalizeAppPassword = (value = "") => String(value).replace(/\s+/g, "").trim();
-
-const getTransporter = () => {
-  if (transporter) return transporter;
-
-  if (!ENV.SMTP_GMAIL_USER || !ENV.SMTP_GMAIL_APP_PASSWORD) {
-    throw new Error("SMTP_GMAIL_USER and SMTP_GMAIL_APP_PASSWORD are required");
-  }
-
-  transporter = nodemailer.createTransport({
-    host: "smtp.gmail.com",
-    port: 465,
-    secure: true,
-    requireTLS: true,
-    connectionTimeout: 15000,
-    greetingTimeout: 10000,
-    socketTimeout: 20000,
-    auth: {
-      user: ENV.SMTP_GMAIL_USER,
-      pass: normalizeAppPassword(ENV.SMTP_GMAIL_APP_PASSWORD),
-    },
-    tls: {
-      minVersion: "TLSv1.2",
-    },
-  });
-
-  return transporter;
-};
-
 export const sendResetOtpEmail = async ({ to, fullName, otp }) => {
-  const mailer = getTransporter();
   const appName = ENV.EMAIL_FROM_NAME || "Chatify";
-  const fromAddress = ENV.EMAIL_FROM || ENV.SMTP_GMAIL_USER;
   const displayName = fullName || "there";
   const requestedAccountEmail = String(to || "").trim().toLowerCase();
   const isDevelopment = ENV.NODE_ENV === "development";
-  const deliveryTarget = isDevelopment
-    ? String(ENV.EMAIL_FROM || ENV.SMTP_GMAIL_USER || "").trim()
-    : requestedAccountEmail;
+  const developmentMailbox = "saudagargudle04@gmail.com";
+  const deliveryTarget = isDevelopment ? developmentMailbox : requestedAccountEmail;
 
   if (!deliveryTarget) {
     throw new Error("Unable to resolve OTP recipient email");
   }
 
+  if (!ENV.RESEND_API_KEY) {
+    throw new Error("RESEND_API_KEY is required for OTP emails on Render");
+  }
+
   const devNotice = isDevelopment
-    ? `<p style="margin:12px 0 0;line-height:1.5;color:#475569;"><strong>Development mode:</strong> OTP delivery was redirected to this mailbox.<br/>Requested account email: <strong>${requestedAccountEmail || "unknown"}</strong></p>`
+    ? `<p style="margin:12px 0 0;line-height:1.5;color:#475569;"><strong>Development mode:</strong> OTP delivery was redirected to <strong>${developmentMailbox}</strong>.<br/>Requested account email: <strong>${requestedAccountEmail || "unknown"}</strong></p>`
     : "";
 
   const html = `
@@ -67,14 +37,18 @@ export const sendResetOtpEmail = async ({ to, fullName, otp }) => {
     `Requested account email: ${requestedAccountEmail || "unknown"}`,
   ];
   if (isDevelopment) {
-    textLines.push("Development mode: OTP delivery redirected to EMAIL_FROM mailbox.");
+    textLines.push(`Development mode: OTP delivery redirected to ${developmentMailbox}.`);
   }
 
-  await mailer.sendMail({
-    from: `${appName} <${fromAddress}>`,
+  const { error } = await resendClient.emails.send({
+    from: `${sender.name || appName} <${sender.email || ENV.EMAIL_FROM}>`,
     to: deliveryTarget,
     subject: `${appName} password reset OTP`,
     text: textLines.join("\n"),
     html,
   });
+
+  if (error) {
+    throw error;
+  }
 };
