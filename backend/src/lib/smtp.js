@@ -3,6 +3,8 @@ import { ENV } from "./env.js";
 
 let transporter = null;
 
+const normalizeAppPassword = (value = "") => String(value).replace(/\s+/g, "").trim();
+
 const getTransporter = () => {
   if (transporter) return transporter;
 
@@ -11,10 +13,19 @@ const getTransporter = () => {
   }
 
   transporter = nodemailer.createTransport({
-    service: "gmail",
+    host: "smtp.gmail.com",
+    port: 587,
+    secure: false,
+    requireTLS: true,
+    connectionTimeout: 15000,
+    greetingTimeout: 10000,
+    socketTimeout: 20000,
     auth: {
       user: ENV.SMTP_GMAIL_USER,
-      pass: ENV.SMTP_GMAIL_APP_PASSWORD,
+      pass: normalizeAppPassword(ENV.SMTP_GMAIL_APP_PASSWORD),
+    },
+    tls: {
+      minVersion: "TLSv1.2",
     },
   });
 
