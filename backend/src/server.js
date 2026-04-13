@@ -50,6 +50,9 @@ const corsOptions = {
 
 const PORT = ENV.PORT || 3000;
 
+// Render sits behind a reverse proxy; trust proxy headers so req.ip is correct.
+app.set("trust proxy", 1);
+
 app.use(express.json({limit: '20mb'}));
 app.use(cors(corsOptions));
 

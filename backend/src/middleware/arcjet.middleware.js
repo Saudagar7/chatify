@@ -11,7 +11,16 @@ export const arcjetProtection = async (req, res, next) => {
 
     if(decision.isDenied) {
         if(decision.reason.isRateLimit) {
-            return res.status(429).json({ message: "Rate limit exceeded. Please try again later." });
+            const retryAfterSeconds = Number(decision.reason?.retryAfter || 60);
+            if (Number.isFinite(retryAfterSeconds) && retryAfterSeconds > 0) {
+                res.set("Retry-After", Math.ceil(retryAfterSeconds).toString());
+            }
+            return res.status(429).json({
+                message: "Rate limit exceeded. Please try again later.",
+                retryAfter: Number.isFinite(retryAfterSeconds) && retryAfterSeconds > 0
+                    ? Math.ceil(retryAfterSeconds)
+                    : 60,
+            });
         }
 
 
